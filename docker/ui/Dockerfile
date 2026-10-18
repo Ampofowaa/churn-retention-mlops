@@ -7,7 +7,7 @@
 # lightgbm is never actually imported here and no libgomp1 runtime
 # dependency is needed (pyproject.toml's extras-split comment confirms ui
 # needs neither shap nor lightgbm's training tooling).
-FROM python:3.13-slim AS builder
+FROM python:3.14-slim AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:0.11.16@sha256:440fd6477af86a2f1b38080c539f1672cd22acb1b1a47e321dba5158ab08864d /uv /uvx /bin/
 
@@ -24,7 +24,7 @@ COPY src/ ./src/
 COPY configs/ ./configs/
 RUN uv sync --frozen --no-dev --extra ui
 
-FROM python:3.13-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 RUN groupadd --system app && useradd --system --gid app --create-home app
 
