@@ -149,6 +149,40 @@ services:
         awslogs-create-group: "true"
         awslogs-stream: ui
 
+  # Grafana Alloy — scrapes api:8000/metrics, remote_writes to Grafana
+  # Cloud (config.alloy, delivered the same way as compose.prod.yml itself
+  # — see infra/compute.tf's deploy_config_files map). GRAFANA_ENDPOINT/
+  # GRAFANA_API_KEY already flow through refresh-env.sh into .env; both are
+  # still "REPLACE_ME" until pulled from the Grafana Cloud console by hand
+  # (docs/PHASE_12A_TODO.md Group 12), so this service starts but has
+  # nowhere real to remote_write to until that's done.
+  alloy:
+    image: grafana/alloy:v1.5.1
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - ./config.alloy:/etc/alloy/config.alloy:ro
+    command:
+      - run
+      - /etc/alloy/config.alloy
+      - --storage.path=/var/lib/alloy/data
+      - --server.http.listen-addr=0.0.0.0:12345
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:12345/-/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging:
+      driver: awslogs
+      options:
+        awslogs-group: /telco-churn/alloy
+        awslogs-region: us-east-1
+        awslogs-create-group: "true"
+        awslogs-stream: alloy
+
   caddy:
     image: caddy:2-alpine
     restart: unless-stopped

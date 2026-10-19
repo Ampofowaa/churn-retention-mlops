@@ -1,0 +1,347 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "The Grafana Cloud Prometheus/Mimir data source Alloy's remote_write (config.alloy) is writing into.",
+      "type": "datasource",
+      "pluginId": "prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "11.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "title": "Telco Churn Serving — Operational Dashboard",
+  "description": "RED metrics + model/canary health for the deployed serving API. Written by hand (not exported from a live Grafana) as part of docs/PHASE_12A_TODO.md Group 12 — import via Grafana Cloud's dashboard import, mapping DS_PROMETHEUS to the Alloy-fed Prometheus/Mimir data source. Each panel's description carries the alert expression/threshold it's meant to back, per docs/monitoring-metrics.md — Grafana-managed alert rules themselves are created separately (Grafana Cloud console or API), not embedded in this dashboard JSON.",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": ["telco-churn", "serving", "group-12"],
+  "timezone": "browser",
+  "time": { "from": "now-6h", "to": "now" },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate",
+      "description": "sum(rate(http_requests_total[5m])) by (handler). Framework-provided (prometheus_fastapi_instrumentator) — every HTTP call, success or failure. Do not alert on zero traffic alone; a portfolio demo's normal state is near-zero requests — use the scrape-health panel below for \"is it down\".",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(http_requests_total[5m])) by (handler)",
+          "legendFormat": "{{handler}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Request latency p50 / p99",
+      "description": "histogram_quantile(0.50|0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le)). Alert: p99 sustained above a chosen SLO (no fixed value shipped here — set empirically once there's real traffic history, same framing as the CPUCreditBalance threshold in docs/monitoring-metrics.md).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "5xx error rate",
+      "description": "sum(rate(http_requests_total{status=~\"5..\"}[5m])). Alert: sustained > 0 for a few minutes, or the 5xx/total ratio above a few percent — a working system sits at zero.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m]))",
+          "legendFormat": "5xx/s"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Predictions by scoring_path",
+      "description": "sum(rate(predictions_total[5m])) by (scoring_path). champion_only / champion_with_shadow / challenger_canary — a canary configured at fraction=0.1 should show challenger_canary tracking near 10% of total.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(predictions_total[5m])) by (scoring_path)",
+          "legendFormat": "{{scoring_path}}"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Predicted probability — p50 / p90 by model_version",
+      "description": "histogram_quantile(0.50|0.90, sum(rate(predicted_probability_bucket[15m])) by (le, model_version)). Not normally a hard alert — investigate-trigger on a shift under a single, unchanged model_version (real drift); a difference between two different version labels is expected, not drift.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum(rate(predicted_probability_bucket[15m])) by (le, model_version))",
+          "legendFormat": "{{model_version}} p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.90, sum(rate(predicted_probability_bucket[15m])) by (le, model_version))",
+          "legendFormat": "{{model_version}} p90"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Model inference time p99 by model",
+      "description": "histogram_quantile(0.99, sum(rate(model_inference_seconds_bucket[5m])) by (le, model)). A spike here with total request latency (panel 2) flat means the model itself is slow, not a dependency. Also cross-check CPUCreditBalance on a t3.small.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(model_inference_seconds_bucket[5m])) by (le, model))",
+          "legendFormat": "{{model}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "SHAP explanation time p99",
+      "description": "histogram_quantile(0.99, sum(rate(explanation_seconds_bucket[5m])) by (le)). A sudden whole-distribution shift (not just a longer tail) is the signature of a caching regression — the explainer should be built once per model reload, never per request.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.99, sum(rate(explanation_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Prediction log write failures",
+      "description": "sum(rate(prediction_log_write_failures_total[15m])) by (route). No healthy non-zero baseline — a sustained rate > 0 for a few minutes IS the alert, no threshold tuning needed. A silent audit-trail gap; the response itself was still served.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(prediction_log_write_failures_total[15m])) by (route)",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Customer lookup timeouts",
+      "description": "sum(rate(customer_lookup_timeouts_total[15m])) by (route). Same framing as prediction_log_write_failures — no healthy baseline, any sustained rate > 0 is the alert. A direct \"Postgres is stalled\" signal. If both this and panel 8 climb together, suspect a shared Postgres degradation.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(customer_lookup_timeouts_total[15m])) by (route)",
+          "legendFormat": "{{route}}"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Champion/challenger agreement rate",
+      "description": "sum(rate(champion_challenger_agreement_total{outcome=\"agree\"}[15m])) by (mode) / sum(rate(champion_challenger_agreement_total[15m])) by (mode). Not normally a hard alert — disagreement is often the expected, desired outcome of an active evaluation. Read together with panel 11, never alone.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(champion_challenger_agreement_total{outcome=\"agree\"}[15m])) by (mode) / sum(rate(champion_challenger_agreement_total[15m])) by (mode)",
+          "legendFormat": "{{mode}}"
+        }
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Champion/challenger score distance — p50 / p90 by mode",
+      "description": "histogram_quantile(0.50|0.90, sum(rate(champion_challenger_score_distance_bucket[15m])) by (le, mode)). Large distance + high agreement = most customers sit far from the threshold on both sides. Small distance + low agreement = customers cluster right at the threshold.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.50, sum(rate(champion_challenger_score_distance_bucket[15m])) by (le, mode))",
+          "legendFormat": "{{mode}} p50"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "histogram_quantile(0.90, sum(rate(champion_challenger_score_distance_bucket[15m])) by (le, mode))",
+          "legendFormat": "{{mode}} p90"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Active threshold (t*) by model_version",
+      "description": "active_threshold{model_version}. A pure mirror of what the pipeline is actually using to compute served_threshold/decision — plot champion and challenger side by side during a canary. A step here with predicted_probability (panel 5) flat means a policy/threshold change, not drift. Read directly alongside panel 19 (predictions_above_threshold_total's rate) — a policy-change step and a drift-driven step are visually distinguishable that way.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "active_threshold",
+          "legendFormat": "{{model_version}}"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "title": "Cost scenario constants (base scenario)",
+      "description": "cost_scenario_constants{constant, model_version} — ltv/cost/retention_rate mirrored unchanged from configs/costs.yaml at model load. Multiply against predictions_above_threshold_total/contact counters at query time for an \"estimated campaign spend\" view — never a substitute for economics.py's own authoritative, bootstrap-CI'd EV in MLflow.",
+      "type": "table",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "cost_scenario_constants",
+          "format": "table",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 14,
+      "title": "Champion poll health — seconds since last successful poll",
+      "description": "time() - champion_last_successful_poll_timestamp_seconds. Alert if this exceeds a few multiples of serving.poll_interval_seconds — that specifically means the poll loop itself has stopped running or keeps erroring internally, the exact case the hot-reload's fail-open design is built to hide from everything else.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "time() - champion_last_successful_poll_timestamp_seconds",
+          "legendFormat": "seconds since last successful poll"
+        }
+      ]
+    },
+    {
+      "id": 15,
+      "title": "Champion version — registry vs served",
+      "description": "champion_version_registry vs champion_version_served. Both already read every poll for the version-change comparison the poll loop makes anyway. Alert if they differ for longer than a few poll intervals — catches a reload that's refused (dependency mismatch) or fails outright, which panel 14 alone can't see (the poll tick still completes normally in both cases). A brief mismatch right after a promotion is expected, not an incident.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "champion_version_registry",
+          "legendFormat": "registry"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "champion_version_served",
+          "legendFormat": "served"
+        }
+      ]
+    },
+    {
+      "id": 16,
+      "title": "Model reload outcomes",
+      "description": "sum(rate(model_reload_total[15m])) by (role, outcome). outcome=refused/failed sustained above zero deserves the same \"no healthy baseline\" treatment as panels 8/9 — these previously only hit logger.warning, never a metric.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(model_reload_total[15m])) by (role, outcome)",
+          "legendFormat": "{{role}}/{{outcome}}"
+        }
+      ]
+    },
+    {
+      "id": 17,
+      "title": "Contact capacity utilization",
+      "description": "contact_capacity_utilization — fraction of this cycle's capacity_limit actually filled by contact=true rows, from the most recent /predict/batch call. Not normally an alert target; a sustained 100% says capacity (not the model/threshold) is now the binding constraint, worth a top-K-by-EV policy conversation per ANALYSIS.md.",
+      "type": "gauge",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
+      "fieldConfig": {
+        "defaults": {
+          "min": 0,
+          "max": 1,
+          "unit": "percentunit"
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "contact_capacity_utilization",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 18,
+      "title": "Scrape health — up{job=\"api\"}",
+      "description": "up{job=\"api\"}. Alert rules (create separately in Grafana Cloud, not embedded in this dashboard): up{job=\"api\"}==0 for 2-3m (Alloy's own scrape-health series — evaluated off-box, so a dead box still triggers it); absent(up{job=\"api\"}) for ~5m, or Grafana's \"No data -> Alerting\" setting (catches Alloy itself being down or remote_write failing, which up==0 alone can't see since no series would even exist to be 0 — e.g. GRAFANA_API_KEY still REPLACE_ME).",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 64 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" } } },
+            { "type": "value", "options": { "1": { "text": "UP", "color": "green" } } }
+          ]
+        }
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "up{job=\"api\"}",
+          "instant": true
+        }
+      ]
+    },
+    {
+      "id": 19,
+      "title": "Flag rate (predictions_above_threshold_total) by model_version",
+      "description": "sum(rate(predictions_above_threshold_total[1h])) by (model_version). Mirrors the decision field exactly — served_proba >= served_threshold — not contact (see panel 17 for capacity-constrained contact, a different thing). Read directly alongside panel 12 (active_threshold): this rate can move because the scores moved (gradual, real drift) or because t* itself moved (a step, at the exact moment a new threshold.json loaded) — panel 12 resolves which one directly instead of requiring the inference.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 72 },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+          "expr": "sum(rate(predictions_above_threshold_total[1h])) by (model_version)",
+          "legendFormat": "{{model_version}}"
+        }
+      ]
+    }
+  ]
+}

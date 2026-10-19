@@ -30,3 +30,9 @@ variable "project_name" {
   type        = string
   default     = "telco-churn"
 }
+
+variable "cpu_credit_balance_alarm_threshold" {
+  description = "Low-balance CPUCreditBalance alarm threshold — a judgment call, best tuned once there's real traffic history rather than guessed upfront"
+  type        = number
+  default     = 50
+}
