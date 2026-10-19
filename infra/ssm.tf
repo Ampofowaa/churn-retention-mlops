@@ -53,7 +53,7 @@ resource "aws_ssm_parameter" "grafana_endpoint" {
 
 resource "aws_ssm_parameter" "grafana_api_key" {
   name        = "/telco-churn/grafana-api-key"
-  description = "Grafana Cloud API key for Alloy's remote_write; set by hand from the Grafana Cloud console"
+  description = "Grafana Cloud Access Policy token for Alloy's remote_write basic_auth password; set by hand from the Grafana Cloud console"
   type        = "SecureString"
   value       = "REPLACE_ME"
 
@@ -63,6 +63,27 @@ resource "aws_ssm_parameter" "grafana_api_key" {
 
   tags = {
     Name = "${var.project_name}-grafana-api-key"
+  }
+}
+
+# Confirmed 2026-10-19 against a real Grafana Cloud stack: remote_write auth
+# is basic_auth (username = numeric Stack ID), not a bare bearer token as
+# config.alloy originally assumed. Not a secret on its own (a public-facing
+# stack identifier), but kept in SSM alongside the other two for one
+# refresh-env.sh pull and because Terraform has no simpler per-human-value
+# story than this one.
+resource "aws_ssm_parameter" "grafana_username" {
+  name        = "/telco-churn/grafana-username"
+  description = "Grafana Cloud numeric Stack ID; the username half of Alloy's remote_write basic_auth. Set by hand from the Grafana Cloud console"
+  type        = "String"
+  value       = "REPLACE_ME"
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+
+  tags = {
+    Name = "${var.project_name}-grafana-username"
   }
 }
 
