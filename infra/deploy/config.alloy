@@ -9,19 +9,14 @@
 // rules (up{job="api"}==0, absent(up{job="api"})) depend on that exact
 // label value.
 //
-// GRAFANA_ENDPOINT/GRAFANA_API_KEY come from the two SSM params
-// refresh-env.sh already renders into .env (infra/ssm.tf) — still
-// "REPLACE_ME" until pulled from the Grafana Cloud console by hand (Group
-// 12's own checklist item, deliberately not done here).
+// GRAFANA_ENDPOINT/GRAFANA_API_KEY/GRAFANA_USERNAME come from the three SSM
+// params refresh-env.sh renders into .env (infra/ssm.tf).
 //
-// Auth assumption, unverified against a real Grafana Cloud stack (no
-// credentials available while writing this): a Grafana Cloud Access Policy
-// token authenticates remote_write as a bearer token alone, no separate
-// username/instance-ID needed. If the real key turns out to be a classic
-// Grafana Cloud API key instead (HTTP basic auth, username = numeric stack
-// instance ID), swap bearer_token below for a basic_auth { username =
-// ... ; password = ... } block and add a third SSM param for the username
-// — a one-line change, not a redesign.
+// Confirmed 2026-10-19 against a real Grafana Cloud stack: remote_write auth
+// is HTTP basic_auth, username = the numeric Stack ID, password = a
+// Grafana.com Access Policy token scoped to metrics:write
+// (set:alloy-data-write). The original bearer-token-only assumption,
+// written before any real credentials were available, was wrong.
 
 prometheus.scrape "api" {
 	targets = [
@@ -37,6 +32,9 @@ prometheus.remote_write "grafana_cloud" {
 	endpoint {
 		url = sys.env("GRAFANA_ENDPOINT")
 
-		bearer_token = sys.env("GRAFANA_API_KEY")
+		basic_auth {
+			username = sys.env("GRAFANA_USERNAME")
+			password = sys.env("GRAFANA_API_KEY")
+		}
 	}
 }

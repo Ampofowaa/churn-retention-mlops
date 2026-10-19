@@ -36,6 +36,7 @@ cat > "$ENV_FILE" <<EOF
 API_KEY=$(get_param "api-key")
 GRAFANA_ENDPOINT=$(get_param "grafana-endpoint")
 GRAFANA_API_KEY=$(get_param "grafana-api-key")
+GRAFANA_USERNAME=$(get_param "grafana-username")
 API_IMAGE=$(get_param "api-image")
 UI_IMAGE=$(get_param "ui-image")
 POSTGRES_URL=$(get_param "rds-url-app")
