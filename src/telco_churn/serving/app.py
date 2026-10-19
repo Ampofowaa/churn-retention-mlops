@@ -15,15 +15,17 @@ even gets to choose what to mock. Every request handler reads `request.app.state
 instead of a module-level global.
 
 **`serving/predict.py` (Task 3) already owns hot-reload, shadow/canary
-routing, and five of the module's Prometheus metrics; `serving/customer_lookup.py`
+routing, and most of the module's Prometheus metrics; `serving/customer_lookup.py`
 owns Postgres ID-resolution — this module is a thin HTTP skin over both, not
 a second implementation of either.** `GET /metrics` needs no extra wiring for
 any of it: `prometheus_fastapi_instrumentator`'s `Instrumentator().expose(app)`
 serves the entire default `prometheus_client` registry, which already
 contains every metric `predict.py` registered at import time, plus this
-module's own `prediction_log_write_failures_total` — owned here rather than
-`serving/prediction_log.py` because this module is what swallows the write
-failure that increments it (see `_log_prediction_background` below).
+module's own `prediction_log_write_failures_total`/`customer_lookup_timeouts_total`/
+`contact_capacity_utilization` — owned here rather than elsewhere because
+this module is what swallows the write failure / times out the lookup /
+calls `select_contacts` (see `_log_prediction_background`,
+`_lookup_customers_or_503`, and `/predict/batch` below).
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from omegaconf import DictConfig
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import ValidationError
 
@@ -83,6 +85,17 @@ _CUSTOMER_LOOKUP_TIMEOUTS_TOTAL = Counter(
     "customers_crm lookups abandoned after serving.database.lookup_timeout_seconds "
     "and answered 503 — a stalled-Postgres signal, independent of request volume.",
     labelnames=("route",),
+)
+# Owned here, not contact_policy.py: select_contacts is a pure ranking
+# function with no notion of "a cycle," only the one batch it was called
+# with — this module is the only caller, so it's the only place that can
+# say how much of the cycle's capacity that one call actually used. No
+# model_version label: capacity is a cycle-level operational constraint
+# from configs/costs.yaml, not a per-model one.
+_CONTACT_CAPACITY_UTILIZATION = Gauge(
+    "contact_capacity_utilization",
+    "Fraction of this cycle's capacity_limit actually filled by contact=true "
+    "rows, from the most recent /predict/batch call.",
 )
 
 
@@ -429,6 +442,12 @@ async def predict_batch_endpoint(
         int(costs_cfg.contact_capacity),
         float(costs_cfg.campaign_budget),
     )
+    if contact_decision.capacity_limit > 0:
+        _CONTACT_CAPACITY_UTILIZATION.set(
+            contact_decision.contact.sum() / contact_decision.capacity_limit
+        )
+    else:
+        _CONTACT_CAPACITY_UTILIZATION.set(0.0)
 
     results: list[BatchPredictionResult] = []
     if scored is not None:

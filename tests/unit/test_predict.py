@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import mlflow
 import mlflow.sklearn
@@ -340,6 +341,194 @@ def test_resolve_challenger_model_loads_the_aliased_version(
 
     assert bundle is not None
     assert bundle.model_version == version
+
+
+# ---------------------------------------------------------------------------
+# Group 12 serving metrics: active_threshold / cost_scenario_constants /
+# champion_version_registry+served / model_reload_total /
+# champion_last_successful_poll_timestamp_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_build_model_bundle_sets_active_threshold_and_cost_scenario_gauges(
+    predict_cfg: DictConfig,
+) -> None:
+    """Both gauges must be pure mirrors of what build_model_bundle already
+    resolved — _register_test_model's fixed costs (c=60.0, r=0.3, ltv=500.0)
+    and threshold=0.4, read back unchanged."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1, threshold=0.4)
+
+    predict.build_model_bundle(version, predict_cfg)
+
+    assert REGISTRY.get_sample_value(
+        "active_threshold", {"model_version": version}
+    ) == pytest.approx(0.4)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants", {"constant": "ltv", "model_version": version}
+    ) == pytest.approx(500.0)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants", {"constant": "cost", "model_version": version}
+    ) == pytest.approx(60.0)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants",
+        {"constant": "retention_rate", "model_version": version},
+    ) == pytest.approx(0.3)
+
+
+def test_resolve_champion_model_updates_version_registry_and_served_gauges(
+    predict_cfg: DictConfig,
+) -> None:
+    """Both gauges are plain overwrites (never accumulated), so each poll's
+    own read reflects only that poll's outcome — cold start, then a moved
+    alias, each checked right after the call that caused it."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    assert REGISTRY.get_sample_value("champion_version_registry") == pytest.approx(
+        float(v1)
+    )
+    assert REGISTRY.get_sample_value("champion_version_served") == pytest.approx(
+        float(v1)
+    )
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed.model_version == v2
+    assert REGISTRY.get_sample_value("champion_version_registry") == pytest.approx(
+        float(v2)
+    )
+    assert REGISTRY.get_sample_value("champion_version_served") == pytest.approx(
+        float(v2)
+    )
+
+
+def _reload_total(role: str, outcome: str) -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "model_reload_total", {"role": role, "outcome": outcome}
+        )
+        or 0.0
+    )
+
+
+def test_resolve_champion_model_reload_counter_increments_on_success(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    before = _reload_total("champion", "success")
+
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed.model_version == v2
+    assert _reload_total("champion", "success") == before + 1
+
+
+def test_resolve_champion_model_reload_counter_increments_on_refused(
+    predict_cfg: DictConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    monkeypatch.setattr(
+        predict,
+        "diff_environment",
+        lambda model_uri, packages: environment_parity.EnvironmentDiff(
+            mismatches={"numpy": ("1.0.0", "2.0.0")}
+        ),
+    )
+    before = _reload_total("champion", "refused")
+
+    with caplog.at_level(logging.WARNING):
+        refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed is current
+    assert _reload_total("champion", "refused") == before + 1
+
+
+def test_resolve_champion_model_reload_counter_increments_on_failure(
+    predict_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", version)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    def _boom(cfg: DictConfig) -> str | None:
+        raise RuntimeError("mlflow unreachable")
+
+    monkeypatch.setattr(predict, "resolve_champion_version", _boom)
+    before = _reload_total("champion", "failed")
+
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed is current
+    assert _reload_total("champion", "failed") == before + 1
+
+
+def test_resolve_challenger_model_reload_counter_increments_on_success(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=2)
+    _set_alias(name, "challenger", version)
+    before = _reload_total("challenger", "success")
+
+    bundle = predict.resolve_challenger_model(predict_cfg, None)
+
+    assert bundle is not None
+    assert _reload_total("challenger", "success") == before + 1
+
+
+def test_resolve_challenger_model_reload_counter_increments_on_alias_resolution_failure(
+    predict_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(cfg: DictConfig) -> str | None:
+        raise RuntimeError("mlflow unreachable")
+
+    monkeypatch.setattr(predict, "resolve_challenger_version", _boom)
+    before = _reload_total("challenger", "failed")
+
+    result = predict.resolve_challenger_model(predict_cfg, None)
+
+    assert result is None
+    assert _reload_total("challenger", "failed") == before + 1
+
+
+def test_resolve_serving_model_sets_last_successful_poll_timestamp(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", version)
+
+    before = time.time()
+    predict.resolve_serving_model(predict_cfg, None)
+    after = time.time()
+
+    observed = REGISTRY.get_sample_value(
+        "champion_last_successful_poll_timestamp_seconds"
+    )
+
+    assert observed is not None
+    assert before <= observed <= after
 
 
 # ---------------------------------------------------------------------------

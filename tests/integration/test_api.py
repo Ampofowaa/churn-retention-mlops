@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from prometheus_client import REGISTRY
 from sqlalchemy import create_engine, text
 
 from telco_churn.serving.app import app
@@ -143,6 +144,26 @@ def test_predict_batch_id_only_resolution_partial_success(
         assert result["decision"] == (result["probability"] >= result["threshold"])
         assert isinstance(result["contact"], bool)
     assert body["capacity_limit"] > 0
+
+
+def test_predict_batch_sets_contact_capacity_utilization_gauge(
+    api_client: TestClient,
+) -> None:
+    """contact_capacity_utilization must mirror the exact ratio this same
+    response's own contact/capacity_limit fields already imply — a pure
+    aggregate of what select_contacts just returned, not a separate
+    computation that could silently diverge from it."""
+    payload = [{"customerid": "serve-0001"}, {"customerid": "serve-0002"}]
+
+    response = api_client.post("/predict/batch", json=payload)
+
+    assert response.status_code == 200
+    body = response.json()
+    expected = sum(r["contact"] for r in body["results"]) / body["capacity_limit"]
+
+    observed = REGISTRY.get_sample_value("contact_capacity_utilization")
+
+    assert observed == pytest.approx(expected)
 
 
 def test_predict_batch_over_max_size_returns_413(api_client: TestClient) -> None:

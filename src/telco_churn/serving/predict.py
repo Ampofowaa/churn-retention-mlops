@@ -64,7 +64,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 from omegaconf import DictConfig
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from telco_churn.features.generate import compute_charge_per_service
 from telco_churn.models.artifacts import (
@@ -243,6 +243,72 @@ _EXPLANATION_SECONDS = Histogram(
     buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
 )
 
+# Pure mirrors of values build_model_bundle already resolved — never a
+# recomputation, so neither gauge can diverge from what the pipeline
+# actually used for this model_version.
+_ACTIVE_THRESHOLD = Gauge(
+    "active_threshold",
+    "t* currently in effect for this model_version's base cost scenario — "
+    "the same value served_threshold/decision are computed from.",
+    labelnames=("model_version",),
+)
+# Mirrors configs/costs.yaml's base-scenario constants, not a live EV
+# computation — economics.py already owns EV (with bootstrap CIs and
+# costs_config_hash attribution); duplicating that formula here would be a
+# second implementation of the same rule. Grafana multiplies this against
+# the already-live predictions_above_threshold_total/contact counters at
+# query time instead.
+_COST_SCENARIO_CONSTANTS = Gauge(
+    "cost_scenario_constants",
+    "Base-scenario cost constant (ltv/cost/retention_rate), mirrored "
+    "unchanged from the resolved CostScenario at model load — set once per "
+    "model_version, never recomputed.",
+    labelnames=("constant", "model_version"),
+)
+
+# A UNIX timestamp, not a duration — prometheus_client Gauges only hold
+# whatever was last .set(), so a "seconds since" value would freeze between
+# polls instead of climbing; the idiomatic pattern is to expose the last
+# success's own timestamp and let the alert rule compute
+# time() - champion_last_successful_poll_timestamp_seconds. Reset on every
+# resolve_serving_model tick that returns at all — both
+# resolve_champion_model/resolve_challenger_model already catch and log
+# their own refresh failures internally (fail-open), so this only stops
+# advancing if the poll loop itself has died, the one failure mode fail-open
+# is built to hide from everything else.
+_CHAMPION_LAST_SUCCESSFUL_POLL_TIMESTAMP_SECONDS = Gauge(
+    "champion_last_successful_poll_timestamp_seconds",
+    "Unix timestamp of the last poll tick that completed without raising — "
+    "alert on time() - this exceeding a few poll intervals.",
+)
+# Both already read every poll for the version-change comparison
+# resolve_champion_model makes anyway — exposing them costs one gauge
+# update each, no extra MLflow calls. Catches a reload that's refused
+# (dependency mismatch) or fails outright, which the poll-health gauge
+# above can't see on its own (the poll tick still completes normally).
+_CHAMPION_VERSION_REGISTRY = Gauge(
+    "champion_version_registry",
+    "The champion alias's current target version number in the MLflow "
+    "registry, as last observed by the poll loop.",
+)
+_CHAMPION_VERSION_SERVED = Gauge(
+    "champion_version_served",
+    "The model_version this process is actually serving champion traffic "
+    "with right now.",
+)
+# role distinguishes champion/challenger since both resolve_champion_model
+# and resolve_challenger_model hit refused/failed sites of their own;
+# outcome mirrors the existing logger.warning event names exactly, just
+# promoted to a metric. Cold start (current=None, the very first load) is
+# deliberately not counted here — this tracks reloads, i.e. something that
+# already had a prior version to compare against, not the initial load.
+_MODEL_RELOAD_TOTAL = Counter(
+    "model_reload_total",
+    "Outcome of a hot-reload attempt triggered by a poll tick that saw the "
+    "registry alias move.",
+    labelnames=("role", "outcome"),
+)
+
 
 @dataclass(frozen=True)
 class ModelBundle:
@@ -357,6 +423,18 @@ def build_model_bundle(version: str, cfg: DictConfig) -> ModelBundle:
         base_scenario_name=_BASE_SCENARIO,
         loaded_at=datetime.now(UTC),
     )
+    base_scenario = scenarios[_BASE_SCENARIO]
+    _ACTIVE_THRESHOLD.labels(model_version=version).set(thresholds[_BASE_SCENARIO])
+    _COST_SCENARIO_CONSTANTS.labels(constant="ltv", model_version=version).set(
+        base_scenario.ltv
+    )
+    _COST_SCENARIO_CONSTANTS.labels(constant="cost", model_version=version).set(
+        base_scenario.cost
+    )
+    _COST_SCENARIO_CONSTANTS.labels(
+        constant="retention_rate", model_version=version
+    ).set(base_scenario.retention_rate)
+
     logger.info(
         "model_bundle_loaded",
         model_version=version,
@@ -405,11 +483,17 @@ def resolve_champion_model(cfg: DictConfig, current: ModelBundle | None) -> Mode
                 f"{cfg.mlflow.registered_model_name}@champion has no target) "
                 "— cannot perform the initial load."
             )
-        return build_model_bundle(version, cfg)
+        _CHAMPION_VERSION_REGISTRY.set(float(version))
+        bundle = build_model_bundle(version, cfg)
+        _CHAMPION_VERSION_SERVED.set(float(bundle.model_version))
+        return bundle
 
     try:
         version = resolve_champion_version(cfg)
+        if version is not None:
+            _CHAMPION_VERSION_REGISTRY.set(float(version))
         if version is None or version == current.model_version:
+            _CHAMPION_VERSION_SERVED.set(float(current.model_version))
             return current
         registered_model_name = str(cfg.mlflow.registered_model_name)
         if not _check_hot_reload_compatible(registered_model_name, version, cfg):
@@ -418,15 +502,23 @@ def resolve_champion_model(cfg: DictConfig, current: ModelBundle | None) -> Mode
                 current_version=current.model_version,
                 target_version=version,
             )
+            _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="refused").inc()
+            _CHAMPION_VERSION_SERVED.set(float(current.model_version))
             return current
-        return build_model_bundle(version, cfg)
+        bundle = build_model_bundle(version, cfg)
     except Exception:
         logger.warning(
             "champion_refresh_failed",
             current_version=current.model_version,
             exc_info=True,
         )
+        _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="failed").inc()
+        _CHAMPION_VERSION_SERVED.set(float(current.model_version))
         return current
+    else:
+        _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="success").inc()
+        _CHAMPION_VERSION_SERVED.set(float(bundle.model_version))
+        return bundle
 
 
 def resolve_challenger_model(
@@ -442,6 +534,7 @@ def resolve_challenger_model(
         version = resolve_challenger_version(cfg)
     except Exception:
         logger.warning("challenger_alias_resolution_failed", exc_info=True)
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="failed").inc()
         return current
 
     if version is None:
@@ -459,11 +552,16 @@ def resolve_challenger_model(
                 current_version=current.model_version,
                 target_version=version,
             )
+            _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="refused").inc()
             return current
-        return build_model_bundle(version, cfg)
+        bundle = build_model_bundle(version, cfg)
     except Exception:
         logger.warning("challenger_refresh_failed", exc_info=True)
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="failed").inc()
         return current
+    else:
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="success").inc()
+        return bundle
 
 
 def resolve_serving_model(
@@ -475,6 +573,7 @@ def resolve_serving_model(
     current_challenger = current.challenger if current is not None else None
     champion = resolve_champion_model(cfg, current_champion)
     challenger = resolve_challenger_model(cfg, current_challenger)
+    _CHAMPION_LAST_SUCCESSFUL_POLL_TIMESTAMP_SECONDS.set_to_current_time()
     return ServingRuntime(champion=champion, challenger=challenger)
 
 
