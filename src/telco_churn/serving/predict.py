@@ -128,39 +128,82 @@ _CANARY_BUCKETS = 10_000
 # registry on import, ready for app.py's GET /metrics to expose once built.
 # No model_version label on either: the champion/challenger pairing already
 # spans exactly two versions, one per side of the comparison.
-_SHADOW_CANARY_SCORE_DISTANCE = Histogram(
-    "shadow_canary_score_distance",
+#
+# Named champion_challenger_*, not shadow_canary_* — the thing being
+# compared is always champion vs. challenger; mode only tags *why* this
+# particular row was dual-scored (shadow watches every request, canary is
+# the routed subset whose challenger score actually went live). A
+# shadow_canary_ prefix directly in front of "score_distance"/"agreement"
+# reads, out of context, as "distance between shadow and canary" rather than
+# "between champion and challenger" — the actual subject belongs in the
+# name, not only in the HELP text.
+_CHAMPION_CHALLENGER_SCORE_DISTANCE = Histogram(
+    "champion_challenger_score_distance",
     "abs(challenger_score - champion_score) per dual-scored shadow/canary request.",
     labelnames=("mode",),
 )
 # Named without the _total suffix: prometheus_client's Counter appends it
 # automatically (OpenMetrics convention) — the exposed metric name still
-# comes out as shadow_canary_agreement_total, just not double-suffixed.
-_SHADOW_CANARY_AGREEMENT_TOTAL = Counter(
-    "shadow_canary_agreement",
+# comes out as champion_challenger_agreement_total, just not
+# double-suffixed. outcome="agree"/"disagree", not agree="true"/"false":
+# the metric name already contains "agreement", so a label key of "agree"
+# repeated the word, and a bare true/false loses its meaning the moment
+# someone reads the label without the HELP text alongside it.
+_CHAMPION_CHALLENGER_AGREEMENT_TOTAL = Counter(
+    "champion_challenger_agreement",
     "Whether champion and challenger landed on the same side of their "
     "respective thresholds for a dual-scored shadow/canary request.",
-    labelnames=("agree", "mode"),
+    labelnames=("outcome", "mode"),
 )
 
 # The three general-purpose serving metrics (as opposed to the two
-# shadow/canary-only ones above) — route is "champion" for a normally-served
-# row, or the dual-score entry's own "mode" ("shadow"/"canary") for a row the
-# challenger was also evaluated against, letting a canary configured at
-# fraction=0.1 be confirmed as actually landing near 10% of traffic rather
-# than just trusting the config. app.py's GET /metrics exposes these with no
-# extra code of its own — prometheus_fastapi_instrumentator's Instrumentator
-# exposes the whole default registry, not just metrics it registered itself.
+# shadow/canary-only ones above). scoring_path names *who actually served
+# this row*, self-describing rather than reusing the dual-score entry's own
+# "mode" ("shadow"/"canary") verbatim — "shadow" on this label would read as
+# "the shadow model served it", when shadow mode's entire point is that the
+# champion always serves while the challenger is only evaluated alongside.
+# champion_with_shadow/challenger_canary make that explicit, and let a canary
+# configured at fraction=0.1 be confirmed as actually landing near 10% of
+# traffic rather than just trusting the config. app.py's GET /metrics exposes
+# these with no extra code of its own — prometheus_fastapi_instrumentator's
+# Instrumentator exposes the whole default registry, not just metrics it
+# registered itself.
 _PREDICTIONS_TOTAL = Counter(
     "predictions_total",
-    "Total predictions served, labelled by routing outcome and the model "
-    "version that actually served them.",
-    labelnames=("route", "model_version"),
+    "Total predictions served, labelled by which model actually served the "
+    "row and how it got there, and the model version that served it.",
+    labelnames=("scoring_path", "model_version"),
 )
+# Explicit buckets: the default buckets (0.005s-10s) are shaped for web
+# request latency, not a [0, 1] probability — 0.25-0.5 (where t* usually
+# sits) would collapse into one bucket, the exact region resolution matters
+# most for drift/PSI-style queries against this histogram.
 _PREDICTED_PROBABILITY = Histogram(
     "predicted_probability",
     "Distribution of served prediction probabilities.",
     labelnames=("model_version",),
+    buckets=(
+        0.05,
+        0.1,
+        0.15,
+        0.2,
+        0.25,
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.6,
+        0.65,
+        0.7,
+        0.75,
+        0.8,
+        0.85,
+        0.9,
+        0.95,
+        1.0,
+    ),
 )
 _PREDICTIONS_ABOVE_THRESHOLD_TOTAL = Counter(
     "predictions_above_threshold_total",
@@ -175,19 +218,29 @@ _PREDICTIONS_ABOVE_THRESHOLD_TOTAL = Counter(
 # covers — a p99 spike on the request histogram alone can't tell you whether
 # the model got slow or a dependency did; this can. labelled "champion"/
 # "challenger" (which bundle actually ran predict_proba), never by
-# served_route — that's a routing outcome, not who computed the score.
+# scoring_path — that's a routing outcome, not who computed the score. One
+# predict_proba call is vectorized over the whole batch (never a per-row
+# loop), so one observation covers however many rows were in that call, not
+# one observation per row. Explicit buckets: the default (0.005s-10s) is
+# shaped for whole-HTTP-request latency; a single-row predict_proba on this
+# model is expected sub-10ms, so the defaults would pile almost every
+# observation into the first bucket or two.
 _MODEL_INFERENCE_SECONDS = Histogram(
     "model_inference_seconds",
     "Wall-clock time of one predict_proba call, per model bundle.",
     labelnames=("model",),
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 )
 # SHAP explanation is a known order of magnitude slower than predict_proba
 # itself (TreeExplainer walks the whole booster) and only runs for
 # include_explanation=True requests — a separate histogram, not a label on
-# the one above, since it wraps a different call entirely.
+# the one above, since it wraps a different call entirely. Explicit buckets
+# shifted up relative to model_inference_seconds' own, to match that
+# order-of-magnitude gap rather than reusing the same scale.
 _EXPLANATION_SECONDS = Histogram(
     "explanation_seconds",
     "Wall-clock time of one local SHAP explanation (explain_with_explainer).",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
 )
 
 
@@ -537,7 +590,7 @@ def score_request(
     served_threshold = np.full(
         n, champion.thresholds[champion.base_scenario_name], dtype=float
     )
-    served_route: list[str] = ["champion"] * n
+    served_scoring_path: list[str] = ["champion_only"] * n
     challenger_proba: NDArray[np.float64] | None = None
     dual_score_rows: list[dict[str, Any]] = []
 
@@ -589,8 +642,13 @@ def score_request(
             logger.info("shadow_canary_dual_score", **entry)
 
             mode = entry["mode"]
-            served_route[i] = mode
-            _SHADOW_CANARY_SCORE_DISTANCE.labels(mode=mode).observe(
+            # Self-describing for predictions_total: who actually served this
+            # row, not the dual-score entry's bare "mode" — see the metric's
+            # own comment for why "shadow" alone would read backwards here.
+            served_scoring_path[i] = (
+                "challenger_canary" if routed else "champion_with_shadow"
+            )
+            _CHAMPION_CHALLENGER_SCORE_DISTANCE.labels(mode=mode).observe(
                 abs(entry["challenger_score"] - entry["champion_score"])
             )
             champion_decision = (
@@ -601,8 +659,12 @@ def score_request(
                 entry["challenger_score"]
                 >= challenger.thresholds[challenger.base_scenario_name]
             )
-            agree = "true" if champion_decision == challenger_decision else "false"
-            _SHADOW_CANARY_AGREEMENT_TOTAL.labels(agree=agree, mode=mode).inc()
+            outcome = (
+                "agree" if champion_decision == challenger_decision else "disagree"
+            )
+            _CHAMPION_CHALLENGER_AGREEMENT_TOTAL.labels(
+                outcome=outcome, mode=mode
+            ).inc()
 
         if canary_enabled and canary_mask.any():
             served_source = [
@@ -621,7 +683,8 @@ def score_request(
 
     for row in range(n):
         _PREDICTIONS_TOTAL.labels(
-            route=served_route[row], model_version=served_model_version[row]
+            scoring_path=served_scoring_path[row],
+            model_version=served_model_version[row],
         ).inc()
         _PREDICTED_PROBABILITY.labels(model_version=served_model_version[row]).observe(
             float(served_proba[row])

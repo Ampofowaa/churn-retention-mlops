@@ -594,29 +594,29 @@ def test_score_request_records_shadow_canary_prometheus_metrics(
     runtime_with_challenger: predict.ServingRuntime,
     replayed_rows: tuple[pd.DataFrame, pd.Series],
 ) -> None:
-    """Every dual-scored row must observe shadow_canary_score_distance and
-    increment shadow_canary_agreement_total exactly once, with the agree
-    label matching whether champion/challenger landed on the same side of
-    their own respective thresholds.
+    """Every dual-scored row must observe champion_challenger_score_distance
+    and increment champion_challenger_agreement_total exactly once, with the
+    outcome label matching whether champion/challenger landed on the same
+    side of their own respective thresholds.
     """
     cfg = OmegaConf.merge(predict_cfg, {"serving": {"shadow": {"enabled": True}}})
     X, customer_ids = replayed_rows
 
     distance_before = _metric_sample_value(
-        predict._SHADOW_CANARY_SCORE_DISTANCE,
-        "shadow_canary_score_distance_count",
+        predict._CHAMPION_CHALLENGER_SCORE_DISTANCE,
+        "champion_challenger_score_distance_count",
         mode="shadow",
     )
     agree_true_before = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="true",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="agree",
         mode="shadow",
     )
     agree_false_before = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="false",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="disagree",
         mode="shadow",
     )
 
@@ -641,20 +641,20 @@ def test_score_request_records_shadow_canary_prometheus_metrics(
             expected_agree_false += 1
 
     distance_after = _metric_sample_value(
-        predict._SHADOW_CANARY_SCORE_DISTANCE,
-        "shadow_canary_score_distance_count",
+        predict._CHAMPION_CHALLENGER_SCORE_DISTANCE,
+        "champion_challenger_score_distance_count",
         mode="shadow",
     )
     agree_true_after = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="true",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="agree",
         mode="shadow",
     )
     agree_false_after = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="false",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="disagree",
         mode="shadow",
     )
 
