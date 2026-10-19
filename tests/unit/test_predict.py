@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import mlflow
 import mlflow.sklearn
@@ -23,6 +24,7 @@ import pytest
 from lightgbm import LGBMClassifier
 from mlflow.models import infer_signature
 from omegaconf import DictConfig, OmegaConf
+from prometheus_client import REGISTRY
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -342,6 +344,194 @@ def test_resolve_challenger_model_loads_the_aliased_version(
 
 
 # ---------------------------------------------------------------------------
+# Group 12 serving metrics: active_threshold / cost_scenario_constants /
+# champion_version_registry+served / model_reload_total /
+# champion_last_successful_poll_timestamp_seconds
+# ---------------------------------------------------------------------------
+
+
+def test_build_model_bundle_sets_active_threshold_and_cost_scenario_gauges(
+    predict_cfg: DictConfig,
+) -> None:
+    """Both gauges must be pure mirrors of what build_model_bundle already
+    resolved — _register_test_model's fixed costs (c=60.0, r=0.3, ltv=500.0)
+    and threshold=0.4, read back unchanged."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1, threshold=0.4)
+
+    predict.build_model_bundle(version, predict_cfg)
+
+    assert REGISTRY.get_sample_value(
+        "active_threshold", {"model_version": version}
+    ) == pytest.approx(0.4)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants", {"constant": "ltv", "model_version": version}
+    ) == pytest.approx(500.0)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants", {"constant": "cost", "model_version": version}
+    ) == pytest.approx(60.0)
+    assert REGISTRY.get_sample_value(
+        "cost_scenario_constants",
+        {"constant": "retention_rate", "model_version": version},
+    ) == pytest.approx(0.3)
+
+
+def test_resolve_champion_model_updates_version_registry_and_served_gauges(
+    predict_cfg: DictConfig,
+) -> None:
+    """Both gauges are plain overwrites (never accumulated), so each poll's
+    own read reflects only that poll's outcome — cold start, then a moved
+    alias, each checked right after the call that caused it."""
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    assert REGISTRY.get_sample_value("champion_version_registry") == pytest.approx(
+        float(v1)
+    )
+    assert REGISTRY.get_sample_value("champion_version_served") == pytest.approx(
+        float(v1)
+    )
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed.model_version == v2
+    assert REGISTRY.get_sample_value("champion_version_registry") == pytest.approx(
+        float(v2)
+    )
+    assert REGISTRY.get_sample_value("champion_version_served") == pytest.approx(
+        float(v2)
+    )
+
+
+def _reload_total(role: str, outcome: str) -> float:
+    return (
+        REGISTRY.get_sample_value(
+            "model_reload_total", {"role": role, "outcome": outcome}
+        )
+        or 0.0
+    )
+
+
+def test_resolve_champion_model_reload_counter_increments_on_success(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    before = _reload_total("champion", "success")
+
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed.model_version == v2
+    assert _reload_total("champion", "success") == before + 1
+
+
+def test_resolve_champion_model_reload_counter_increments_on_refused(
+    predict_cfg: DictConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    v1, _r1 = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", v1)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    v2, _r2 = _register_test_model(name, seed=2)
+    _set_alias(name, "champion", v2)
+    monkeypatch.setattr(
+        predict,
+        "diff_environment",
+        lambda model_uri, packages: environment_parity.EnvironmentDiff(
+            mismatches={"numpy": ("1.0.0", "2.0.0")}
+        ),
+    )
+    before = _reload_total("champion", "refused")
+
+    with caplog.at_level(logging.WARNING):
+        refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed is current
+    assert _reload_total("champion", "refused") == before + 1
+
+
+def test_resolve_champion_model_reload_counter_increments_on_failure(
+    predict_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", version)
+    current = predict.resolve_champion_model(predict_cfg, None)
+
+    def _boom(cfg: DictConfig) -> str | None:
+        raise RuntimeError("mlflow unreachable")
+
+    monkeypatch.setattr(predict, "resolve_champion_version", _boom)
+    before = _reload_total("champion", "failed")
+
+    refreshed = predict.resolve_champion_model(predict_cfg, current)
+
+    assert refreshed is current
+    assert _reload_total("champion", "failed") == before + 1
+
+
+def test_resolve_challenger_model_reload_counter_increments_on_success(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=2)
+    _set_alias(name, "challenger", version)
+    before = _reload_total("challenger", "success")
+
+    bundle = predict.resolve_challenger_model(predict_cfg, None)
+
+    assert bundle is not None
+    assert _reload_total("challenger", "success") == before + 1
+
+
+def test_resolve_challenger_model_reload_counter_increments_on_alias_resolution_failure(
+    predict_cfg: DictConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _boom(cfg: DictConfig) -> str | None:
+        raise RuntimeError("mlflow unreachable")
+
+    monkeypatch.setattr(predict, "resolve_challenger_version", _boom)
+    before = _reload_total("challenger", "failed")
+
+    result = predict.resolve_challenger_model(predict_cfg, None)
+
+    assert result is None
+    assert _reload_total("challenger", "failed") == before + 1
+
+
+def test_resolve_serving_model_sets_last_successful_poll_timestamp(
+    predict_cfg: DictConfig,
+) -> None:
+    name = str(predict_cfg.mlflow.registered_model_name)
+    version, _run_id = _register_test_model(name, seed=1)
+    _set_alias(name, "champion", version)
+
+    before = time.time()
+    predict.resolve_serving_model(predict_cfg, None)
+    after = time.time()
+
+    observed = REGISTRY.get_sample_value(
+        "champion_last_successful_poll_timestamp_seconds"
+    )
+
+    assert observed is not None
+    assert before <= observed <= after
+
+
+# ---------------------------------------------------------------------------
 # load_serving_state_with_retry
 # ---------------------------------------------------------------------------
 
@@ -441,6 +631,38 @@ def test_score_request_shadow_never_routes_but_always_logs(
     assert len(scored.dual_score_rows) == len(X)
     assert all(row["mode"] == "shadow" for row in scored.dual_score_rows)
     assert all(row["served"] == "champion" for row in scored.dual_score_rows)
+
+
+def _histogram_count(name: str, labels: dict[str, str] | None = None) -> float:
+    """Current observation count of a default-registry histogram (0 if unseen)."""
+    value = REGISTRY.get_sample_value(f"{name}_count", labels or {})
+    return value or 0.0
+
+
+def test_score_request_observes_inference_time_per_model_bundle(
+    predict_cfg: DictConfig,
+    runtime_with_challenger: predict.ServingRuntime,
+    replayed_rows: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """One predict_proba call per bundle per request, each timed under its own
+    model label — so a slow challenger can't hide inside champion latency."""
+    cfg = OmegaConf.merge(predict_cfg, {"serving": {"shadow": {"enabled": True}}})
+    X, customer_ids = replayed_rows
+    champion_before = _histogram_count("model_inference_seconds", {"model": "champion"})
+    challenger_before = _histogram_count(
+        "model_inference_seconds", {"model": "challenger"}
+    )
+
+    predict.score_request(X, customer_ids, runtime_with_challenger, cfg)
+
+    assert (
+        _histogram_count("model_inference_seconds", {"model": "champion"})
+        == champion_before + 1
+    )
+    assert (
+        _histogram_count("model_inference_seconds", {"model": "challenger"})
+        == challenger_before + 1
+    )
 
 
 def test_canary_bucket_mask_is_stable_for_a_repeated_salt() -> None:
@@ -561,29 +783,29 @@ def test_score_request_records_shadow_canary_prometheus_metrics(
     runtime_with_challenger: predict.ServingRuntime,
     replayed_rows: tuple[pd.DataFrame, pd.Series],
 ) -> None:
-    """Every dual-scored row must observe shadow_canary_score_distance and
-    increment shadow_canary_agreement_total exactly once, with the agree
-    label matching whether champion/challenger landed on the same side of
-    their own respective thresholds.
+    """Every dual-scored row must observe champion_challenger_score_distance
+    and increment champion_challenger_agreement_total exactly once, with the
+    outcome label matching whether champion/challenger landed on the same
+    side of their own respective thresholds.
     """
     cfg = OmegaConf.merge(predict_cfg, {"serving": {"shadow": {"enabled": True}}})
     X, customer_ids = replayed_rows
 
     distance_before = _metric_sample_value(
-        predict._SHADOW_CANARY_SCORE_DISTANCE,
-        "shadow_canary_score_distance_count",
+        predict._CHAMPION_CHALLENGER_SCORE_DISTANCE,
+        "champion_challenger_score_distance_count",
         mode="shadow",
     )
     agree_true_before = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="true",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="agree",
         mode="shadow",
     )
     agree_false_before = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="false",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="disagree",
         mode="shadow",
     )
 
@@ -608,20 +830,20 @@ def test_score_request_records_shadow_canary_prometheus_metrics(
             expected_agree_false += 1
 
     distance_after = _metric_sample_value(
-        predict._SHADOW_CANARY_SCORE_DISTANCE,
-        "shadow_canary_score_distance_count",
+        predict._CHAMPION_CHALLENGER_SCORE_DISTANCE,
+        "champion_challenger_score_distance_count",
         mode="shadow",
     )
     agree_true_after = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="true",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="agree",
         mode="shadow",
     )
     agree_false_after = _metric_sample_value(
-        predict._SHADOW_CANARY_AGREEMENT_TOTAL,
-        "shadow_canary_agreement_total",
-        agree="false",
+        predict._CHAMPION_CHALLENGER_AGREEMENT_TOTAL,
+        "champion_challenger_agreement_total",
+        outcome="disagree",
         mode="shadow",
     )
 
@@ -811,13 +1033,27 @@ def test_predict_single_with_explanation(
     assert len(response.explanation.top_features) <= 5
 
 
+def test_predict_single_with_explanation_observes_explanation_time(
+    predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
+) -> None:
+    request = _predict_request()
+    request.include_explanation = True
+    before = _histogram_count("explanation_seconds")
+
+    predict.predict_single(request, champion_only_runtime_raw_fields, predict_cfg)
+
+    assert _histogram_count("explanation_seconds") == before + 1
+
+
 def test_predict_single_without_explanation_omits_it(
     predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
 ) -> None:
+    before = _histogram_count("explanation_seconds")
     response, _scored = predict.predict_single(
         _predict_request(), champion_only_runtime_raw_fields, predict_cfg
     )
     assert response.explanation is None
+    assert _histogram_count("explanation_seconds") == before
 
 
 def test_predict_single_matches_golden_predictions_json(

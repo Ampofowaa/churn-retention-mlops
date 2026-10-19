@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -63,7 +64,7 @@ import numpy as np
 import pandas as pd
 from numpy.typing import NDArray
 from omegaconf import DictConfig
-from prometheus_client import Counter, Histogram
+from prometheus_client import Counter, Gauge, Histogram
 
 from telco_churn.features.generate import compute_charge_per_service
 from telco_churn.models.artifacts import (
@@ -127,45 +128,185 @@ _CANARY_BUCKETS = 10_000
 # registry on import, ready for app.py's GET /metrics to expose once built.
 # No model_version label on either: the champion/challenger pairing already
 # spans exactly two versions, one per side of the comparison.
-_SHADOW_CANARY_SCORE_DISTANCE = Histogram(
-    "shadow_canary_score_distance",
+#
+# Named champion_challenger_*, not shadow_canary_* — the thing being
+# compared is always champion vs. challenger; mode only tags *why* this
+# particular row was dual-scored (shadow watches every request, canary is
+# the routed subset whose challenger score actually went live). A
+# shadow_canary_ prefix directly in front of "score_distance"/"agreement"
+# reads, out of context, as "distance between shadow and canary" rather than
+# "between champion and challenger" — the actual subject belongs in the
+# name, not only in the HELP text.
+_CHAMPION_CHALLENGER_SCORE_DISTANCE = Histogram(
+    "champion_challenger_score_distance",
     "abs(challenger_score - champion_score) per dual-scored shadow/canary request.",
     labelnames=("mode",),
 )
 # Named without the _total suffix: prometheus_client's Counter appends it
 # automatically (OpenMetrics convention) — the exposed metric name still
-# comes out as shadow_canary_agreement_total, just not double-suffixed.
-_SHADOW_CANARY_AGREEMENT_TOTAL = Counter(
-    "shadow_canary_agreement",
+# comes out as champion_challenger_agreement_total, just not
+# double-suffixed. outcome="agree"/"disagree", not agree="true"/"false":
+# the metric name already contains "agreement", so a label key of "agree"
+# repeated the word, and a bare true/false loses its meaning the moment
+# someone reads the label without the HELP text alongside it.
+_CHAMPION_CHALLENGER_AGREEMENT_TOTAL = Counter(
+    "champion_challenger_agreement",
     "Whether champion and challenger landed on the same side of their "
     "respective thresholds for a dual-scored shadow/canary request.",
-    labelnames=("agree", "mode"),
+    labelnames=("outcome", "mode"),
 )
 
 # The three general-purpose serving metrics (as opposed to the two
-# shadow/canary-only ones above) — route is "champion" for a normally-served
-# row, or the dual-score entry's own "mode" ("shadow"/"canary") for a row the
-# challenger was also evaluated against, letting a canary configured at
-# fraction=0.1 be confirmed as actually landing near 10% of traffic rather
-# than just trusting the config. app.py's GET /metrics exposes these with no
-# extra code of its own — prometheus_fastapi_instrumentator's Instrumentator
-# exposes the whole default registry, not just metrics it registered itself.
+# shadow/canary-only ones above). scoring_path names *who actually served
+# this row*, self-describing rather than reusing the dual-score entry's own
+# "mode" ("shadow"/"canary") verbatim — "shadow" on this label would read as
+# "the shadow model served it", when shadow mode's entire point is that the
+# champion always serves while the challenger is only evaluated alongside.
+# champion_with_shadow/challenger_canary make that explicit, and let a canary
+# configured at fraction=0.1 be confirmed as actually landing near 10% of
+# traffic rather than just trusting the config. app.py's GET /metrics exposes
+# these with no extra code of its own — prometheus_fastapi_instrumentator's
+# Instrumentator exposes the whole default registry, not just metrics it
+# registered itself.
 _PREDICTIONS_TOTAL = Counter(
     "predictions_total",
-    "Total predictions served, labelled by routing outcome and the model "
-    "version that actually served them.",
-    labelnames=("route", "model_version"),
+    "Total predictions served, labelled by which model actually served the "
+    "row and how it got there, and the model version that served it.",
+    labelnames=("scoring_path", "model_version"),
 )
+# Explicit buckets: the default buckets (0.005s-10s) are shaped for web
+# request latency, not a [0, 1] probability — 0.25-0.5 (where t* usually
+# sits) would collapse into one bucket, the exact region resolution matters
+# most for drift/PSI-style queries against this histogram.
 _PREDICTED_PROBABILITY = Histogram(
     "predicted_probability",
     "Distribution of served prediction probabilities.",
     labelnames=("model_version",),
+    buckets=(
+        0.05,
+        0.1,
+        0.15,
+        0.2,
+        0.25,
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.6,
+        0.65,
+        0.7,
+        0.75,
+        0.8,
+        0.85,
+        0.9,
+        0.95,
+        1.0,
+    ),
 )
 _PREDICTIONS_ABOVE_THRESHOLD_TOTAL = Counter(
     "predictions_above_threshold_total",
     "Total predictions whose served probability crossed the operating "
     "threshold (t*) that was in effect for them.",
     labelnames=("model_version",),
+)
+
+# Isolates the model's own predict_proba cost from the surrounding request
+# (DB customer-lookup, serialization, FastAPI overhead) that
+# prometheus_fastapi_instrumentator's total-request-latency histogram already
+# covers — a p99 spike on the request histogram alone can't tell you whether
+# the model got slow or a dependency did; this can. labelled "champion"/
+# "challenger" (which bundle actually ran predict_proba), never by
+# scoring_path — that's a routing outcome, not who computed the score. One
+# predict_proba call is vectorized over the whole batch (never a per-row
+# loop), so one observation covers however many rows were in that call, not
+# one observation per row. Explicit buckets: the default (0.005s-10s) is
+# shaped for whole-HTTP-request latency; a single-row predict_proba on this
+# model is expected sub-10ms, so the defaults would pile almost every
+# observation into the first bucket or two.
+_MODEL_INFERENCE_SECONDS = Histogram(
+    "model_inference_seconds",
+    "Wall-clock time of one predict_proba call, per model bundle.",
+    labelnames=("model",),
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+# SHAP explanation is a known order of magnitude slower than predict_proba
+# itself (TreeExplainer walks the whole booster) and only runs for
+# include_explanation=True requests — a separate histogram, not a label on
+# the one above, since it wraps a different call entirely. Explicit buckets
+# shifted up relative to model_inference_seconds' own, to match that
+# order-of-magnitude gap rather than reusing the same scale.
+_EXPLANATION_SECONDS = Histogram(
+    "explanation_seconds",
+    "Wall-clock time of one local SHAP explanation (explain_with_explainer).",
+    buckets=(0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0),
+)
+
+# Pure mirrors of values build_model_bundle already resolved — never a
+# recomputation, so neither gauge can diverge from what the pipeline
+# actually used for this model_version.
+_ACTIVE_THRESHOLD = Gauge(
+    "active_threshold",
+    "t* currently in effect for this model_version's base cost scenario — "
+    "the same value served_threshold/decision are computed from.",
+    labelnames=("model_version",),
+)
+# Mirrors configs/costs.yaml's base-scenario constants, not a live EV
+# computation — economics.py already owns EV (with bootstrap CIs and
+# costs_config_hash attribution); duplicating that formula here would be a
+# second implementation of the same rule. Grafana multiplies this against
+# the already-live predictions_above_threshold_total/contact counters at
+# query time instead.
+_COST_SCENARIO_CONSTANTS = Gauge(
+    "cost_scenario_constants",
+    "Base-scenario cost constant (ltv/cost/retention_rate), mirrored "
+    "unchanged from the resolved CostScenario at model load — set once per "
+    "model_version, never recomputed.",
+    labelnames=("constant", "model_version"),
+)
+
+# A UNIX timestamp, not a duration — prometheus_client Gauges only hold
+# whatever was last .set(), so a "seconds since" value would freeze between
+# polls instead of climbing; the idiomatic pattern is to expose the last
+# success's own timestamp and let the alert rule compute
+# time() - champion_last_successful_poll_timestamp_seconds. Reset on every
+# resolve_serving_model tick that returns at all — both
+# resolve_champion_model/resolve_challenger_model already catch and log
+# their own refresh failures internally (fail-open), so this only stops
+# advancing if the poll loop itself has died, the one failure mode fail-open
+# is built to hide from everything else.
+_CHAMPION_LAST_SUCCESSFUL_POLL_TIMESTAMP_SECONDS = Gauge(
+    "champion_last_successful_poll_timestamp_seconds",
+    "Unix timestamp of the last poll tick that completed without raising — "
+    "alert on time() - this exceeding a few poll intervals.",
+)
+# Both already read every poll for the version-change comparison
+# resolve_champion_model makes anyway — exposing them costs one gauge
+# update each, no extra MLflow calls. Catches a reload that's refused
+# (dependency mismatch) or fails outright, which the poll-health gauge
+# above can't see on its own (the poll tick still completes normally).
+_CHAMPION_VERSION_REGISTRY = Gauge(
+    "champion_version_registry",
+    "The champion alias's current target version number in the MLflow "
+    "registry, as last observed by the poll loop.",
+)
+_CHAMPION_VERSION_SERVED = Gauge(
+    "champion_version_served",
+    "The model_version this process is actually serving champion traffic "
+    "with right now.",
+)
+# role distinguishes champion/challenger since both resolve_champion_model
+# and resolve_challenger_model hit refused/failed sites of their own;
+# outcome mirrors the existing logger.warning event names exactly, just
+# promoted to a metric. Cold start (current=None, the very first load) is
+# deliberately not counted here — this tracks reloads, i.e. something that
+# already had a prior version to compare against, not the initial load.
+_MODEL_RELOAD_TOTAL = Counter(
+    "model_reload_total",
+    "Outcome of a hot-reload attempt triggered by a poll tick that saw the "
+    "registry alias move.",
+    labelnames=("role", "outcome"),
 )
 
 
@@ -282,6 +423,18 @@ def build_model_bundle(version: str, cfg: DictConfig) -> ModelBundle:
         base_scenario_name=_BASE_SCENARIO,
         loaded_at=datetime.now(UTC),
     )
+    base_scenario = scenarios[_BASE_SCENARIO]
+    _ACTIVE_THRESHOLD.labels(model_version=version).set(thresholds[_BASE_SCENARIO])
+    _COST_SCENARIO_CONSTANTS.labels(constant="ltv", model_version=version).set(
+        base_scenario.ltv
+    )
+    _COST_SCENARIO_CONSTANTS.labels(constant="cost", model_version=version).set(
+        base_scenario.cost
+    )
+    _COST_SCENARIO_CONSTANTS.labels(
+        constant="retention_rate", model_version=version
+    ).set(base_scenario.retention_rate)
+
     logger.info(
         "model_bundle_loaded",
         model_version=version,
@@ -330,11 +483,17 @@ def resolve_champion_model(cfg: DictConfig, current: ModelBundle | None) -> Mode
                 f"{cfg.mlflow.registered_model_name}@champion has no target) "
                 "— cannot perform the initial load."
             )
-        return build_model_bundle(version, cfg)
+        _CHAMPION_VERSION_REGISTRY.set(float(version))
+        bundle = build_model_bundle(version, cfg)
+        _CHAMPION_VERSION_SERVED.set(float(bundle.model_version))
+        return bundle
 
     try:
         version = resolve_champion_version(cfg)
+        if version is not None:
+            _CHAMPION_VERSION_REGISTRY.set(float(version))
         if version is None or version == current.model_version:
+            _CHAMPION_VERSION_SERVED.set(float(current.model_version))
             return current
         registered_model_name = str(cfg.mlflow.registered_model_name)
         if not _check_hot_reload_compatible(registered_model_name, version, cfg):
@@ -343,15 +502,23 @@ def resolve_champion_model(cfg: DictConfig, current: ModelBundle | None) -> Mode
                 current_version=current.model_version,
                 target_version=version,
             )
+            _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="refused").inc()
+            _CHAMPION_VERSION_SERVED.set(float(current.model_version))
             return current
-        return build_model_bundle(version, cfg)
+        bundle = build_model_bundle(version, cfg)
     except Exception:
         logger.warning(
             "champion_refresh_failed",
             current_version=current.model_version,
             exc_info=True,
         )
+        _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="failed").inc()
+        _CHAMPION_VERSION_SERVED.set(float(current.model_version))
         return current
+    else:
+        _MODEL_RELOAD_TOTAL.labels(role="champion", outcome="success").inc()
+        _CHAMPION_VERSION_SERVED.set(float(bundle.model_version))
+        return bundle
 
 
 def resolve_challenger_model(
@@ -367,6 +534,7 @@ def resolve_challenger_model(
         version = resolve_challenger_version(cfg)
     except Exception:
         logger.warning("challenger_alias_resolution_failed", exc_info=True)
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="failed").inc()
         return current
 
     if version is None:
@@ -384,11 +552,16 @@ def resolve_challenger_model(
                 current_version=current.model_version,
                 target_version=version,
             )
+            _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="refused").inc()
             return current
-        return build_model_bundle(version, cfg)
+        bundle = build_model_bundle(version, cfg)
     except Exception:
         logger.warning("challenger_refresh_failed", exc_info=True)
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="failed").inc()
         return current
+    else:
+        _MODEL_RELOAD_TOTAL.labels(role="challenger", outcome="success").inc()
+        return bundle
 
 
 def resolve_serving_model(
@@ -400,6 +573,7 @@ def resolve_serving_model(
     current_challenger = current.challenger if current is not None else None
     champion = resolve_champion_model(cfg, current_champion)
     challenger = resolve_challenger_model(cfg, current_challenger)
+    _CHAMPION_LAST_SUCCESSFUL_POLL_TIMESTAMP_SECONDS.set_to_current_time()
     return ServingRuntime(champion=champion, challenger=challenger)
 
 
@@ -503,7 +677,11 @@ def score_request(
 
     champion = runtime.champion
     X_champion = _assemble_model_input(X, champion.committed_features)
+    _inference_start = time.perf_counter()
     champion_proba: NDArray[np.float64] = champion.model.predict_proba(X_champion)[:, 1]
+    _MODEL_INFERENCE_SECONDS.labels(model="champion").observe(
+        time.perf_counter() - _inference_start
+    )
 
     served_source = ["champion"] * n
     served_proba = champion_proba.copy()
@@ -511,7 +689,7 @@ def score_request(
     served_threshold = np.full(
         n, champion.thresholds[champion.base_scenario_name], dtype=float
     )
-    served_route: list[str] = ["champion"] * n
+    served_scoring_path: list[str] = ["champion_only"] * n
     challenger_proba: NDArray[np.float64] | None = None
     dual_score_rows: list[dict[str, Any]] = []
 
@@ -540,9 +718,13 @@ def score_request(
             X_challenger = _assemble_model_input(
                 X.iloc[evaluated_idx], challenger.committed_features
             )
+            _inference_start = time.perf_counter()
             challenger_proba[evaluated_idx] = challenger.model.predict_proba(
                 X_challenger
             )[:, 1]
+            _MODEL_INFERENCE_SECONDS.labels(model="challenger").observe(
+                time.perf_counter() - _inference_start
+            )
 
         for i in evaluated_idx:
             routed = bool(canary_mask[i])
@@ -559,8 +741,13 @@ def score_request(
             logger.info("shadow_canary_dual_score", **entry)
 
             mode = entry["mode"]
-            served_route[i] = mode
-            _SHADOW_CANARY_SCORE_DISTANCE.labels(mode=mode).observe(
+            # Self-describing for predictions_total: who actually served this
+            # row, not the dual-score entry's bare "mode" — see the metric's
+            # own comment for why "shadow" alone would read backwards here.
+            served_scoring_path[i] = (
+                "challenger_canary" if routed else "champion_with_shadow"
+            )
+            _CHAMPION_CHALLENGER_SCORE_DISTANCE.labels(mode=mode).observe(
                 abs(entry["challenger_score"] - entry["champion_score"])
             )
             champion_decision = (
@@ -571,8 +758,12 @@ def score_request(
                 entry["challenger_score"]
                 >= challenger.thresholds[challenger.base_scenario_name]
             )
-            agree = "true" if champion_decision == challenger_decision else "false"
-            _SHADOW_CANARY_AGREEMENT_TOTAL.labels(agree=agree, mode=mode).inc()
+            outcome = (
+                "agree" if champion_decision == challenger_decision else "disagree"
+            )
+            _CHAMPION_CHALLENGER_AGREEMENT_TOTAL.labels(
+                outcome=outcome, mode=mode
+            ).inc()
 
         if canary_enabled and canary_mask.any():
             served_source = [
@@ -591,7 +782,8 @@ def score_request(
 
     for row in range(n):
         _PREDICTIONS_TOTAL.labels(
-            route=served_route[row], model_version=served_model_version[row]
+            scoring_path=served_scoring_path[row],
+            model_version=served_model_version[row],
         ).inc()
         _PREDICTED_PROBABILITY.labels(model_version=served_model_version[row]).observe(
             float(served_proba[row])
@@ -650,9 +842,11 @@ def predict_single(
     if request.include_explanation:
         bundle = _bundle_for_source(runtime, scored.served_source[0])
         X_model = _assemble_model_input(X, bundle.committed_features)
+        _explain_start = time.perf_counter()
         shap_values, feature_names, base_value, Xt = explain_with_explainer(
             bundle.explainer, bundle.preprocessor, X_model
         )
+        _EXPLANATION_SECONDS.observe(time.perf_counter() - _explain_start)
         explained = local_explanations(
             shap_values,
             base_value,

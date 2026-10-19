@@ -151,7 +151,7 @@ flowchart TD
     F -->|yes| H["canary_mask[i] =\nsha256(customerid_i + ':' + challenger_version) % 10_000\n< fraction * 10_000\n(missing customerid -> always False)"]
     G --> I["evaluated_mask = shadow.enabled\n(canary never routes)"]
     H --> J["evaluated_mask = canary_mask OR shadow.enabled"]
-    I --> K["For each evaluated row:\nlog shadow_canary_dual_score\n(both scores, both versions, served, mode)\nobserve shadow_canary_score_distance{mode}\ninc shadow_canary_agreement_total{agree, mode}"]
+    I --> K["For each evaluated row:\nlog shadow_canary_dual_score\n(both scores, both versions, served, mode)\nobserve champion_challenger_score_distance{mode}\ninc champion_challenger_agreement_total{outcome, mode}"]
     J --> K
     K --> L{"canary_mask[i]?"}
     L -->|"yes (canary routed)"| M["served = challenger for row i"]
@@ -159,26 +159,39 @@ flowchart TD
     D --> O
     M --> O
     N --> O
-    O["Every row, evaluated or not:\ninc predictions_total{route, model_version}\nobserve predicted_probability{model_version}\ninc predictions_above_threshold_total{model_version}\n(iff served_proba >= served_threshold)"]
+    O["Every row, evaluated or not:\ninc predictions_total{scoring_path, model_version}\nobserve predicted_probability{model_version}\ninc predictions_above_threshold_total{model_version}\n(iff served_proba >= served_threshold)"]
 ```
 
-**Five Prometheus metrics come out of this one function, not two.** The
-`route` label on the three general-purpose counters/histograms
-(`predictions_total`, `predicted_probability`,
-`predictions_above_threshold_total`) is `"champion"` for a row that was
-never evaluated against the challenger at all, or the dual-score entry's own
-`mode` (`"shadow"`/`"canary"`) for a row that was — so a canary configured
-at `fraction=0.1` can be confirmed as actually landing near 10 % of traffic
-by reading `predictions_total{route="canary"}` against the total, rather
-than just trusting the config. The other two
-(`shadow_canary_score_distance`, a histogram of
+**Five Prometheus metrics come out of this one function, not two.** Only
+`predictions_total` carries a routing-outcome label — `predicted_probability`
+and `predictions_above_threshold_total` are labelled by `model_version`
+alone. `predictions_total`'s own `scoring_path` label is self-describing
+rather than a bare reuse of the dual-score entry's own `mode`
+(`"shadow"`/`"canary"`): `"champion_only"` for a row never evaluated against
+the challenger at all, `"champion_with_shadow"` for a row the challenger was
+also scored against but didn't serve, `"challenger_canary"` for a row the
+challenger actually served. (`mode="shadow"` alone would read as "the shadow
+model served it" — backwards, since shadow mode's whole point is that the
+champion always serves while the challenger is only evaluated alongside.) So
+a canary configured at `fraction=0.1` can be confirmed as actually landing
+near 10 % of traffic by reading
+`predictions_total{scoring_path="challenger_canary"}` against the total,
+rather than just trusting the config. The other two
+(`champion_challenger_score_distance`, a histogram of
 `abs(challenger_score - champion_score)`, and
-`shadow_canary_agreement_total`, a counter of whether champion and
+`champion_challenger_agreement_total`, a counter of whether champion and
 challenger landed on the same side of their own respective thresholds) are
 observed only for evaluated rows, labelled `mode` and (for agreement)
-`agree`. None of the five carry a `model_version` label on the
-shadow/canary-specific pair — the champion/challenger comparison already
-spans exactly two versions, one per side. `serving/app.py`'s `GET /metrics`
+`outcome` (`"agree"`/`"disagree"` — not a bare `true`/`false`, which would
+lose its meaning the moment someone reads the label without the metric's
+own HELP text). Named `champion_challenger_*`, not `shadow_canary_*`: the
+comparison is always champion vs. challenger, and `mode` only tags *why*
+this row was dual-scored — a `shadow_canary_` prefix sitting directly in
+front of "score_distance"/"agreement" reads, out of context, as "distance
+between shadow and canary" rather than naming the actual subject. None of
+the five carry a `model_version` label on the shadow/canary-specific pair —
+the champion/challenger comparison already spans exactly two versions, one
+per side. `serving/app.py`'s `GET /metrics`
 exposes all five with no extra wiring: `prometheus_fastapi_instrumentator`
 exposes the whole default registry `prometheus_client` registered these
 five onto at import time, not just the metrics it instrumented itself.
@@ -254,12 +267,12 @@ of both thresholds, which is exactly what the Prometheus counters below
 confirm rather than assert on faith:
 
 ```text
-shadow_canary_score_distance_count{mode="shadow"}          6
-shadow_canary_score_distance_sum{mode="shadow"}             0.003773806821085267
-shadow_canary_agreement_total{agree="true", mode="shadow"}  6
-predictions_total{route="shadow", model_version="1"}        6
-predicted_probability_count{model_version="1"}              6
-predicted_probability_sum{model_version="1"}                1.0786058976720811
+champion_challenger_score_distance_count{mode="shadow"}                    6
+champion_challenger_score_distance_sum{mode="shadow"}                       0.003773806821085267
+champion_challenger_agreement_total{outcome="agree", mode="shadow"}         6
+predictions_total{scoring_path="champion_with_shadow", model_version="1"}   6
+predicted_probability_count{model_version="1"}                              6
+predicted_probability_sum{model_version="1"}                                1.0786058976720811
 ```
 
 Switching to `canary.enabled=true, fraction=1.0` against the same runtime

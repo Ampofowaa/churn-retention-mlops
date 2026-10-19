@@ -19,6 +19,7 @@ locals {
     "compose.prod.yml" = "${path.module}/deploy/compose.prod.yml"
     "refresh-env.sh"   = "${path.module}/deploy/refresh-env.sh"
     "Caddyfile"        = "${path.module}/deploy/Caddyfile"
+    "config.alloy"     = "${path.module}/deploy/config.alloy"
     # compose.prod.yml's mlflow service is the one prod service with a real
     # build: block (no CD pipeline mints it an image) - the box needs the
     # Dockerfile itself, not just a reference to it. Same file local dev's
