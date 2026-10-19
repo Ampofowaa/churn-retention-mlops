@@ -195,3 +195,39 @@ A bad *model* is not fixed by an image rollback. Re-point `champion` at the
 highest version tagged `promotion_status: promoted` — never "the previous
 version number" (see CLAUDE.md, MLflow Model Registry). The API hot-reloads it
 on its next TTL poll.
+
+# Teardown
+
+Not run now — for the 2027-01-16 shared-credit-balance cutoff (Group 0's
+second calendar reminder), or an earlier decision to stop paying for this
+deployment. Three steps, run from your own terminal in the same sitting —
+leaving the final snapshot behind after `destroy` is the one way this still
+quietly costs money afterward.
+
+1. **Drop RDS deletion protection first** — `terraform destroy` cannot
+   delete `aws_db_instance.main` while `deletion_protection = true` (set
+   deliberately, Group 6). Either flip it to `false` in `infra/data.tf` and
+   `terraform apply` that one change, or pass `-modify-db-instance` by hand:
+   ```bash
+   aws rds modify-db-instance --db-instance-identifier telco-churn-db \
+     --no-deletion-protection --apply-immediately --region us-east-1
+   ```
+2. **`terraform destroy`** — tears down everything Terraform manages (EC2,
+   RDS, S3, ECR, the log groups and alarms above, IAM, networking). RDS
+   takes its own `final_snapshot_identifier` snapshot on the way down
+   (Group 6) — that snapshot is **not** itself a Terraform resource, so
+   `destroy` cannot remove it.
+3. **Delete the final snapshot in this same sitting**, not later —
+   forgetting this step is exactly how a $0 teardown keeps a real ~$1.90/mo
+   charge running silently in the background:
+   ```bash
+   aws rds describe-db-snapshots --db-instance-identifier telco-churn-db \
+     --query "DBSnapshots[].DBSnapshotIdentifier" --region us-east-1
+   aws rds delete-db-snapshot --db-snapshot-identifier <identifier-from-above> \
+     --region us-east-1
+   ```
+
+Not covered here, and not needed for a cost teardown: the MLflow experiment
+history / model registry itself lives in S3 + the RDS `mlflow` database,
+both already gone after step 2 — there is nothing further to clean up in
+MLflow once the infrastructure underneath it is destroyed.
