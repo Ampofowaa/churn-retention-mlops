@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -166,6 +167,27 @@ _PREDICTIONS_ABOVE_THRESHOLD_TOTAL = Counter(
     "Total predictions whose served probability crossed the operating "
     "threshold (t*) that was in effect for them.",
     labelnames=("model_version",),
+)
+
+# Isolates the model's own predict_proba cost from the surrounding request
+# (DB customer-lookup, serialization, FastAPI overhead) that
+# prometheus_fastapi_instrumentator's total-request-latency histogram already
+# covers — a p99 spike on the request histogram alone can't tell you whether
+# the model got slow or a dependency did; this can. labelled "champion"/
+# "challenger" (which bundle actually ran predict_proba), never by
+# served_route — that's a routing outcome, not who computed the score.
+_MODEL_INFERENCE_SECONDS = Histogram(
+    "model_inference_seconds",
+    "Wall-clock time of one predict_proba call, per model bundle.",
+    labelnames=("model",),
+)
+# SHAP explanation is a known order of magnitude slower than predict_proba
+# itself (TreeExplainer walks the whole booster) and only runs for
+# include_explanation=True requests — a separate histogram, not a label on
+# the one above, since it wraps a different call entirely.
+_EXPLANATION_SECONDS = Histogram(
+    "explanation_seconds",
+    "Wall-clock time of one local SHAP explanation (explain_with_explainer).",
 )
 
 
@@ -503,7 +525,11 @@ def score_request(
 
     champion = runtime.champion
     X_champion = _assemble_model_input(X, champion.committed_features)
+    _inference_start = time.perf_counter()
     champion_proba: NDArray[np.float64] = champion.model.predict_proba(X_champion)[:, 1]
+    _MODEL_INFERENCE_SECONDS.labels(model="champion").observe(
+        time.perf_counter() - _inference_start
+    )
 
     served_source = ["champion"] * n
     served_proba = champion_proba.copy()
@@ -540,9 +566,13 @@ def score_request(
             X_challenger = _assemble_model_input(
                 X.iloc[evaluated_idx], challenger.committed_features
             )
+            _inference_start = time.perf_counter()
             challenger_proba[evaluated_idx] = challenger.model.predict_proba(
                 X_challenger
             )[:, 1]
+            _MODEL_INFERENCE_SECONDS.labels(model="challenger").observe(
+                time.perf_counter() - _inference_start
+            )
 
         for i in evaluated_idx:
             routed = bool(canary_mask[i])
@@ -650,9 +680,11 @@ def predict_single(
     if request.include_explanation:
         bundle = _bundle_for_source(runtime, scored.served_source[0])
         X_model = _assemble_model_input(X, bundle.committed_features)
+        _explain_start = time.perf_counter()
         shap_values, feature_names, base_value, Xt = explain_with_explainer(
             bundle.explainer, bundle.preprocessor, X_model
         )
+        _EXPLANATION_SECONDS.observe(time.perf_counter() - _explain_start)
         explained = local_explanations(
             shap_values,
             base_value,

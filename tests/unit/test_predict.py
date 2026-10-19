@@ -23,6 +23,7 @@ import pytest
 from lightgbm import LGBMClassifier
 from mlflow.models import infer_signature
 from omegaconf import DictConfig, OmegaConf
+from prometheus_client import REGISTRY
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import StratifiedKFold
 from sklearn.pipeline import Pipeline
@@ -443,6 +444,38 @@ def test_score_request_shadow_never_routes_but_always_logs(
     assert all(row["served"] == "champion" for row in scored.dual_score_rows)
 
 
+def _histogram_count(name: str, labels: dict[str, str] | None = None) -> float:
+    """Current observation count of a default-registry histogram (0 if unseen)."""
+    value = REGISTRY.get_sample_value(f"{name}_count", labels or {})
+    return value or 0.0
+
+
+def test_score_request_observes_inference_time_per_model_bundle(
+    predict_cfg: DictConfig,
+    runtime_with_challenger: predict.ServingRuntime,
+    replayed_rows: tuple[pd.DataFrame, pd.Series],
+) -> None:
+    """One predict_proba call per bundle per request, each timed under its own
+    model label — so a slow challenger can't hide inside champion latency."""
+    cfg = OmegaConf.merge(predict_cfg, {"serving": {"shadow": {"enabled": True}}})
+    X, customer_ids = replayed_rows
+    champion_before = _histogram_count("model_inference_seconds", {"model": "champion"})
+    challenger_before = _histogram_count(
+        "model_inference_seconds", {"model": "challenger"}
+    )
+
+    predict.score_request(X, customer_ids, runtime_with_challenger, cfg)
+
+    assert (
+        _histogram_count("model_inference_seconds", {"model": "champion"})
+        == champion_before + 1
+    )
+    assert (
+        _histogram_count("model_inference_seconds", {"model": "challenger"})
+        == challenger_before + 1
+    )
+
+
 def test_canary_bucket_mask_is_stable_for_a_repeated_salt() -> None:
     """The same challenger version (salt) must route the same customers to
     the same bucket call to call — the stability guarantee a canary window
@@ -811,13 +844,27 @@ def test_predict_single_with_explanation(
     assert len(response.explanation.top_features) <= 5
 
 
+def test_predict_single_with_explanation_observes_explanation_time(
+    predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
+) -> None:
+    request = _predict_request()
+    request.include_explanation = True
+    before = _histogram_count("explanation_seconds")
+
+    predict.predict_single(request, champion_only_runtime_raw_fields, predict_cfg)
+
+    assert _histogram_count("explanation_seconds") == before + 1
+
+
 def test_predict_single_without_explanation_omits_it(
     predict_cfg: DictConfig, champion_only_runtime_raw_fields: predict.ServingRuntime
 ) -> None:
+    before = _histogram_count("explanation_seconds")
     response, _scored = predict.predict_single(
         _predict_request(), champion_only_runtime_raw_fields, predict_cfg
     )
     assert response.explanation is None
+    assert _histogram_count("explanation_seconds") == before
 
 
 def test_predict_single_matches_golden_predictions_json(
