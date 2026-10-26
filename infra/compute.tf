@@ -85,8 +85,18 @@ resource "aws_instance" "main" {
   #    replacing the instance on every single apply. Left unset (Computed)
   #    instead, accepting the ~$3.65/mo redundant public IPv4 as the price of
   #    not destroying the box on every apply.
+  #  - user_data: also ForceNew, same footgun class as ami above - found
+  #    2026-10-19 when a user-data.sh.tpl edit (CloudWatch agent
+  #    append_dimensions fix) first showed up in `terraform plan` as
+  #    "must be replaced" on the live production box. A template edit should
+  #    never destroy the running instance; the template still documents the
+  #    correct first-boot config for whenever a real replacement happens
+  #    (AMI rotation, instance-type change), same split the ECR
+  #    credential-helper fix already relies on - a template change only
+  #    benefits a *future* instance, the *current* one needs the equivalent
+  #    fix applied by hand via SSM.
   lifecycle {
-    ignore_changes = [ami, associate_public_ip_address]
+    ignore_changes = [ami, associate_public_ip_address, user_data]
   }
 
   root_block_device {

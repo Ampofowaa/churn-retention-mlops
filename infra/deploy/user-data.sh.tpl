@@ -71,6 +71,7 @@ cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCON
 {
   "metrics": {
     "namespace": "telco-churn",
+    "append_dimensions": { "InstanceId": "$${aws:InstanceId}" },
     "metrics_collected": {
       "mem": { "measurement": ["mem_used_percent"] },
       "disk": { "measurement": ["disk_used_percent"], "resources": ["/"] }
