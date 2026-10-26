@@ -3,7 +3,7 @@
 [![CI](https://github.com/Ampofowaa/churn-retention-mlops/actions/workflows/ci.yml/badge.svg)](https://github.com/Ampofowaa/churn-retention-mlops/actions/workflows/ci.yml)
 [![Python 3.13+](https://img.shields.io/badge/python-3.13%2B-blue)](pyproject.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1314%20passing-brightgreen)](CONTRIBUTING.md#testing)
+[![Tests](https://img.shields.io/badge/tests-1330%20passing-brightgreen)](CONTRIBUTING.md#testing)
 [![Coverage](https://img.shields.io/badge/coverage-92%25-brightgreen)](CONTRIBUTING.md#testing)
 
 Tells a telecom retention team **which customers are worth contacting, and what the campaign earns**. Trained, calibrated, gated by a human review, and live on AWS.
@@ -59,7 +59,7 @@ Full list → [ANALYSIS.md §9](ANALYSIS.md#9-known-limitations).
 Raw CSV
   └─ Ingest → Postgres (`customers_raw`)
        └─ Validation (Pandera, 5 quality gates)
-            └─ Feature engineering (SQL views; 9-lap out-of-fold discovery search over candidate features)
+            └─ Feature engineering (SQL view for charge-per-service; pandas feature search)
                  └─ Model training (LightGBM + Optuna tuning) → calibration → register challenger
                       └─ Threshold → sealed-test evaluation → error analysis → human review
                            └─ Champion registration
@@ -69,16 +69,16 @@ Raw CSV
 - **Data:** [IBM Telco Customer Churn](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) — 7,043 customers, 20 features, 26.5 % churn. Stratified split, sealed before any modelling: 5,634 dev (10×10 repeated CV for every decision) / 1,409 test (opened once).
 - **Reproducible:** the nine file-producing stages are a content-hashed DVC DAG (`dvc.yaml`); every run, model, and decision artifact is logged to MLflow.
 - **Served:** FastAPI hot-reloads the champion when its MLflow alias moves — promotion needs no redeploy. Batch scoring ranks customers by expected value and caps contacts at the team's capacity and budget. Shadow and canary rollout of a challenger are built in, off by default.
-- **Deployed:** one EC2 box behind Caddy (HTTPS), with Postgres on RDS and MLflow artifacts on S3. CI runs on every push; CD deploys over SSM, smoke-tests, and rolls back automatically on failure.
+- **Deployed:** one EC2 box behind Caddy (HTTPS), with Postgres on RDS and MLflow artifacts on S3. CI runs on every push; CD deploys over SSM, smoke-tests, and rolls back automatically on failure. CloudWatch alarms and an operational dashboard (CPU, disk, memory, status checks) are live, alongside a Grafana Cloud dashboard covering request-level serving metrics; Grafana-managed alert rules are the one piece still to wire up.
 - **Tested:** unit, integration (ephemeral Postgres via testcontainers), subprocess CLI, FastAPI and Streamlit suites, plus architecture tests that enforce the modelling rules in code.
 
 Detail: [docs/architecture.md](docs/architecture.md) (diagrams, modelling stages, DVC, serving) · [ANALYSIS.md](ANALYSIS.md) (every decision and number)
 
-**Stack:** Python 3.13 · uv · LightGBM · Optuna · scikit-learn · SHAP · Pandera · Postgres · MLflow · DVC · FastAPI · Streamlit · Docker · GitHub Actions · AWS (EC2, RDS, S3, ECR)
+**Stack:** Python 3.13 · uv · LightGBM · Optuna · scikit-learn · SHAP · Pandera · Postgres · MLflow · DVC · FastAPI · Streamlit · Docker · GitHub Actions · AWS (EC2, RDS, S3, ECR, CloudWatch) · Grafana Cloud
 
 ## Status
 
-Phases 0–9 (data through serving), retraining foundations, and the AWS deployment are done. **Next:** Prefect orchestration of monthly retraining and daily drift checks, then ML monitoring. Roadmap → [PROJECT_PLAN.md](docs/PROJECT_PLAN.md) · history → [CHANGELOG.md](CHANGELOG.md)
+Phases 0–9 (data through serving), retraining foundations, the AWS deployment, and CloudWatch + Grafana Cloud monitoring (alarms and both dashboards) are done. **Planned:** Grafana-managed alert rules, then Prefect orchestration of monthly retraining and daily drift checks. Roadmap → [PROJECT_PLAN.md](docs/PROJECT_PLAN.md) · history → [CHANGELOG.md](CHANGELOG.md)
 
 ## Run it locally
 

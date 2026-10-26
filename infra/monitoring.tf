@@ -139,11 +139,26 @@ resource "aws_cloudwatch_metric_alarm" "mem_used_percent" {
 }
 
 resource "aws_cloudwatch_metric_alarm" "disk_used_percent" {
-  alarm_name          = "${var.project_name}-disk-used-percent-high"
-  alarm_description   = "disk_used_percent > 90%. Known cause: old SHA-tagged release images piling up — confirm `docker image prune -af` is actually running in prune_on_box.sh before investigating further."
-  namespace           = "telco-churn"
-  metric_name         = "disk_used_percent"
-  dimensions          = { InstanceId = aws_instance.main.id }
+  alarm_name        = "${var.project_name}-disk-used-percent-high"
+  alarm_description = "disk_used_percent > 90%. Known cause: old SHA-tagged release images piling up — confirm `docker image prune -af` is actually running in prune_on_box.sh before investigating further."
+  namespace         = "telco-churn"
+  metric_name       = "disk_used_percent"
+  # Unlike mem_used_percent, the agent's disk plugin auto-adds path/device/
+  # fstype dimensions (to distinguish which mounted filesystem) on top of
+  # append_dimensions - found 2026-10-19 when this alarm stayed stuck on
+  # "no datapoints" even after the InstanceId dimension fix that recovered
+  # mem_used_percent. CloudWatch metric identity is the FULL dimension set,
+  # so an alarm naming only InstanceId was querying a metric that doesn't
+  # exist. device/fstype are hardcoded to this box's actual root volume
+  # (confirmed via `aws cloudwatch list-metrics`) - stable for a single
+  # gp3 EBS root volume on this AMI, but would need updating if the root
+  # device ever changes (e.g. a different instance type's NVMe naming).
+  dimensions = {
+    InstanceId = aws_instance.main.id
+    path       = "/"
+    device     = "nvme0n1p1"
+    fstype     = "ext4"
+  }
   statistic           = "Average"
   period              = 300
   evaluation_periods  = 1
@@ -176,4 +191,131 @@ resource "aws_cloudwatch_metric_alarm" "cpu_credit_balance_low" {
   treat_missing_data  = "notBreaching"
 
   alarm_actions = [aws_sns_topic.alerts.arn]
+}
+
+# Native CloudWatch dashboard mirroring the 5 operational alarms above, so
+# they're watchable in one console view next to where they fire — not a
+# replacement for the Grafana Cloud dashboard, which only covers the
+# Prometheus/Alloy app-side metrics and has no visibility into these
+# host-level CloudWatch metrics at all. Free under CloudWatch's
+# 3-dashboards tier.
+#
+# First cut (2026-10-19) tried embedding each alarm's ARN via
+# `annotations.alarms` on its matching metric widget, to draw the threshold
+# as a red line on the graph - PutDashboard rejected all 5 widgets with a
+# schema "oneOf" error. Per AWS's own Dashboard Body Structure docs: a
+# metric widget's `annotations` field is for alarm annotations OR
+# horizontal/vertical annotations, never both, and "if you specify an alarm
+# annotation, you cannot also specify a `metrics` array in the same
+# widget" - the two are mutually exclusive, not layerable. Fixed by using
+# the dedicated `alarm` widget type instead (one combined status widget,
+# all 5 alarms, sorted so anything not OK surfaces first) alongside the 5
+# plain metric widgets with no `annotations` block.
+resource "aws_cloudwatch_dashboard" "operational" {
+  dashboard_name = "${var.project_name}-operational"
+
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type   = "alarm"
+        x      = 0
+        y      = 0
+        width  = 24
+        height = 3
+        properties = {
+          title  = "Alarm status"
+          sortBy = "stateUpdatedTimestamp"
+          alarms = [
+            aws_cloudwatch_metric_alarm.cpu_utilization.arn,
+            aws_cloudwatch_metric_alarm.status_check_failed.arn,
+            aws_cloudwatch_metric_alarm.mem_used_percent.arn,
+            aws_cloudwatch_metric_alarm.disk_used_percent.arn,
+            aws_cloudwatch_metric_alarm.cpu_credit_balance_low.arn,
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 3
+        width  = 12
+        height = 6
+        properties = {
+          title   = "CPU utilization"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/EC2", "CPUUtilization", "InstanceId", aws_instance.main.id, { stat = "Average", period = 300 }]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 3
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Status check failed"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/EC2", "StatusCheckFailed", "InstanceId", aws_instance.main.id, { stat = "Maximum", period = 60 }]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 9
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Memory used %"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["telco-churn", "mem_used_percent", "InstanceId", aws_instance.main.id, { stat = "Average", period = 300 }]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 12
+        y      = 9
+        width  = 12
+        height = 6
+        properties = {
+          title   = "Disk used %"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          # Full dimension set required - see the matching comment on
+          # aws_cloudwatch_metric_alarm.disk_used_percent above.
+          metrics = [
+            ["telco-churn", "disk_used_percent", "InstanceId", aws_instance.main.id, "path", "/", "device", "nvme0n1p1", "fstype", "ext4", { stat = "Average", period = 300 }]
+          ]
+        }
+      },
+      {
+        type   = "metric"
+        x      = 0
+        y      = 15
+        width  = 12
+        height = 6
+        properties = {
+          title   = "CPU credit balance"
+          region  = var.aws_region
+          view    = "timeSeries"
+          stacked = false
+          metrics = [
+            ["AWS/EC2", "CPUCreditBalance", "InstanceId", aws_instance.main.id, { stat = "Minimum", period = 300 }]
+          ]
+        }
+      }
+    ]
+  })
 }
