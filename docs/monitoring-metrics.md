@@ -19,11 +19,12 @@ Business metrics (expected value, campaign economics) live in MLflow via
 `evaluate.py`/`economics.py`, never duplicated here as a live computation —
 only mirrored where explicitly noted below.
 
-Status column: ✅ live today. A CloudWatch metric additionally marked
-"alarm authored, not yet applied" has the metric itself live but its
-alarm only written in Terraform so far — see `docs/PHASE_12A_TODO.md`
-Group 12 for what's still outstanding end-to-end (Alloy/Grafana deployment,
-`terraform apply`, the two Grafana SSM placeholders).
+Status column: ✅ live today — every metric and alarm on this page is
+applied and confirmed (all 8 CloudWatch alarms read `OK`, Alloy is
+`remote_write`ing to a real Grafana Cloud stack, both the Grafana and
+native CloudWatch dashboards are imported/applied). See
+`docs/PHASE_12A_TODO.md` Group 12 for the remaining non-metric work
+(Grafana alert *rules*, as opposed to the dashboard itself).
 
 ---
 
@@ -422,15 +423,20 @@ much of the cycle's capacity that call actually used.
 
 **Scrape/pipeline-health alerting** (not a Prometheus metric, but directly
 relevant to reading every metric above): `up{job="api"}==0` for 2–3m and
-`absent(up{job="api"})` for ~5m — `infra/deploy/config.alloy` now scrapes
+`absent(up{job="api"})` for ~5m — `infra/deploy/config.alloy` scrapes
 `api:8000/metrics` with `job_name = "api"` pinned explicitly so these
-expressions resolve correctly once Alloy is actually deployed and
-`remote_write`ing to a real Grafana Cloud endpoint (the two SSM params are
-still `REPLACE_ME` — see `docs/PHASE_12A_TODO.md` Group 12). The alert
-rules themselves, plus one Grafana dashboard covering every metric on this
-page, are written at `infra/deploy/grafana-dashboard.json` — imported by
-hand into Grafana Cloud (each panel's description carries the exact
-alert expression/threshold it backs), not created from this repo.
+expressions resolve correctly. **Live end-to-end since 2026-10-19:** Alloy
+authenticates to Grafana Cloud's hosted Prometheus/Mimir via HTTP
+`basic_auth` (username = the numeric Stack ID, password = an Access Policy
+token) — the original `config.alloy` draft assumed a bearer token alone,
+which turned out to be wrong the moment real credentials were available;
+corrected the same day. `up{job="api"}` confirmed `1` continuously in the
+Grafana Cloud Explore UI. One Grafana dashboard covering every metric on
+this page (`infra/deploy/grafana-dashboard.json`, 19 panels, each panel's
+description carrying the exact alert expression/threshold it backs) is
+imported into the live stack — the Grafana-managed alert *rules*
+themselves are still a manual console/API step, not yet created (see
+`docs/PHASE_12A_TODO.md` Group 12).
 
 **Deploy-time alert suppression:** `cd.yml`'s rolling restart briefly fails
 `/health`/`up` during the container-recreate window on every merge to
@@ -461,7 +467,7 @@ hard without opening the hood. **Memory and disk-space usage are different**
 `disk_used_percent` only exist once the CloudWatch agent is running inside
 the instance to read and report them.
 
-## `CPUUtilization` ✅ (alarm authored in `infra/monitoring.tf`, not yet `terraform apply`'d)
+## `CPUUtilization` ✅
 
 **AWS/EC2 namespace, no agent.** Percentage of allocated compute capacity in
 use, reported every 5 minutes on basic monitoring (this project's tier — no
@@ -489,7 +495,7 @@ is actually configured in Unlimited mode, not Standard** (see
 apply to it today, but the reasoning is worth keeping for any future
 Standard-mode instance.
 
-## `StatusCheckFailed` ✅ (alarm authored in `infra/monitoring.tf`, not yet `terraform apply`'d)
+## `StatusCheckFailed` ✅
 
 **AWS/EC2 namespace, no agent.** Runs every minute regardless of monitoring
 tier — unlike `CPUUtilization`, the 5-min/1-min granularity split only
@@ -519,7 +525,7 @@ same "silence must still alert" principle behind the `up==0`/`absent()`
 alerts above: Alloy watches the API; `StatusCheckFailed` watches the box
 Alloy itself runs on.
 
-## `CPUCreditBalance` ✅ (alarm authored in `infra/monitoring.tf`, not yet `terraform apply`'d; risk framing corrected 2026-10-19)
+## `CPUCreditBalance` ✅ (risk framing corrected 2026-10-19)
 
 **AWS/EC2 namespace, no agent.** Number of CPU credits currently banked on a
 burstable instance; a `t3.small` earns them continuously and spends them
@@ -556,7 +562,7 @@ defensible; this closes what had been an unexamined AWS default rather
 than an actual decision. No `credit_specification` block added to
 `aws_instance.main`.
 
-## `mem_used_percent` ✅ (alarm authored in `infra/monitoring.tf`, not yet `terraform apply`'d)
+## `mem_used_percent` ✅
 
 **Custom CloudWatch namespace, via the CloudWatch agent** installed on the
 host (not in a container — host-level only, per `user-data.sh.tpl`;
@@ -572,14 +578,65 @@ that's already OOM'd before, the metric just stops arriving, and silence
 must not read as "fine" at precisely the moment memory trouble is most
 likely.
 
-## `disk_used_percent` ✅ (alarm authored in `infra/monitoring.tf`, not yet `terraform apply`'d)
+**Known trap, hit for real 2026-10-19: the alarm's `dimensions` must match
+the agent's *actual* published dimension set exactly, or it silently reads
+"no data" forever — never an error.** The agent config originally had no
+`append_dimensions` block, so it published under `host=<hostname>`, not
+`InstanceId`; the alarm (and dashboard widget) queried `InstanceId`, a
+series with zero datapoints, so `treat_missing_data = "breaching"` kept
+firing even though the agent was working fine. Fixed by adding
+`append_dimensions: {"InstanceId": "${aws:InstanceId}"}` to
+`user-data.sh.tpl`'s agent config (`infra/deploy/user-data.sh.tpl`) — a
+template change that, notably, only benefits a *future* box, since
+cloud-init never re-runs on an already-booted instance; the live box
+needed the equivalent fix applied by hand. `aws cloudwatch list-metrics
+--namespace telco-churn --metric-name <name>` is the fastest way to
+confirm what dimension set a metric is *actually* publishing under before
+writing an alarm or dashboard widget against it — don't assume.
 
-**Same CloudWatch agent, same namespace** as `mem_used_percent`.
+## `disk_used_percent` ✅
 
-**Alert:** `> 90%`, same `treat_missing_data = "breaching"` reasoning. Not
-hypothetical: the CD rollback drill (`docker-build.yml`/`cd.yml`) hit a real
-`no space left on device` failure from old SHA-tagged release images piling
-up before `prune_on_box.sh` was fixed to prune aggressively (`-af` instead
-of dangling-only). That failure surfaced as a confusing SSM timeout two
-layers removed from the actual cause — this alarm, once built, is what
-should surface it directly instead.
+**Same CloudWatch agent, same namespace** as `mem_used_percent` — but
+**not the same dimension set**, which is its own trap, distinct from the
+one above. `aws_cloudwatch_metric_alarm.disk_used_percent`'s `dimensions`
+in `infra/monitoring.tf` carries `InstanceId`, `path`, `device`, `fstype`
+— four keys, not one. The agent's disk plugin auto-adds `path`/`device`/
+`fstype` on top of `append_dimensions`, to distinguish *which* mounted
+filesystem (`mem_used_percent` has no such sub-resource, so it only ever
+carries the one dimension — the two metrics are not symmetric). CloudWatch
+metric identity is the **full** dimension set: an alarm naming only
+`InstanceId` queries a metric that doesn't exist at all, not the right one
+with extra fields silently ignored. `device=nvme0n1p1`/`fstype=ext4` are
+hardcoded to this box's actual root volume (confirmed via `list-metrics`,
+not guessed) — stable for a single gp3 EBS root volume on this AMI, would
+need updating only if the root device naming ever changed.
+
+**Alert:** `> 90%`, same `treat_missing_data = "breaching"` reasoning as
+`mem_used_percent`. Not hypothetical: the CD rollback drill
+(`docker-build.yml`/`cd.yml`) hit a real `no space left on device` failure
+from old SHA-tagged release images piling up before `prune_on_box.sh` was
+fixed to prune aggressively (`-af` instead of dangling-only). That failure
+surfaced as a confusing SSM timeout two layers removed from the actual
+cause — this alarm is what should surface it directly instead.
+
+## Native CloudWatch Dashboard (`telco-churn-operational`) ✅
+
+A deliberate complement to the Grafana Cloud dashboard above, not a
+replacement — Grafana only covers the Prometheus/Alloy serving-layer
+metrics on this page and has zero visibility into the AWS/EC2 and
+CloudWatch-agent metrics in this section. `infra/monitoring.tf`'s
+`aws_cloudwatch_dashboard.operational`: one `alarm`-type status widget
+(all 5 operational alarms, sorted so anything not `OK` surfaces first)
+plus 5 plain `metric` widgets (CPU, status check, mem, disk, CPU credit
+balance), each targeting the same namespace/dimensions its matching alarm
+already uses. Free under CloudWatch's 3-dashboards tier.
+
+**Known trap:** a `metric`-type widget's `annotations` (alarm-threshold
+form) and its `metrics` array are **mutually exclusive** — per AWS's own
+Dashboard Body Structure docs, "if you specify an alarm annotation, you
+cannot also specify a `metrics` array in the same widget." A first draft
+tried layering each alarm's threshold onto its matching graph via
+`annotations.alarms` and got a generic `PutDashboard` 400 ("Should match
+exactly one schema in oneOf") on every widget. The dedicated `alarm`
+widget type is the correct way to show live alarm state on a dashboard —
+not a threshold line on a graph.
